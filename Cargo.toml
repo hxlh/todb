@@ -6,6 +6,8 @@ members = [
     "crates/observability",
     "crates/memory",
     "crates/rpc",
+    "crates/sql",
+    "server",
 ]
 
 [workspace.package]
@@ -20,6 +22,7 @@ runtime = { path = "crates/runtime" }
 observability = { path = "crates/observability" }
 memory = { path = "crates/memory" }
 rpc = { path = "crates/rpc" }
+sql = { path = "crates/sql" }
 
 # async runtime
 tokio = { version = "1", features = ["full"] }
@@ -56,3 +59,9 @@ serde_yaml = "0.9"
 # utilities
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# http / sql
+axum = { version = "0.8", features = ["macros", "json"] }
+datafusion = "44"
+reqwest = { version = "0.12", features = ["json"] }
