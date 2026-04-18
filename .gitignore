@@ -1,5 +1,6 @@
 /target
 .claude
+.worktrees/
 openspec
 CLAUDE.md
 docs
