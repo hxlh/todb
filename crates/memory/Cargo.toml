@@ -1,0 +1,11 @@
+[package]
+name = "memory"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common = { workspace = true }
+tikv-jemalloc-sys = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }
+tikv-jemallocator = { workspace = true }
+tracing = { workspace = true }

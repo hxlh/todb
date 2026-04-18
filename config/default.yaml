@@ -1,0 +1,10 @@
+node:
+  node_id: 1
+  data_dir: ./data
+
+log:
+  level: info
+  format: json
+
+rpc:
+  listen_addr: 127.0.0.1:50051

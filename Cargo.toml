@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/runtime",
+    "crates/observability",
+    "crates/memory",
+    "crates/rpc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# internal
+common = { path = "crates/common" }
+runtime = { path = "crates/runtime" }
+observability = { path = "crates/observability" }
+memory = { path = "crates/memory" }
+rpc = { path = "crates/rpc" }
+
+# async runtime
+tokio = { version = "1", features = ["full"] }
+
+# logging & tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = "0.27"
+opentelemetry-prometheus = "0.27"
+prometheus = "0.13"
+
+# error handling
+thiserror = "2"
+anyhow = "1"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+prost = "0.13"
+prost-types = "0.13"
+tonic = "0.12"
+
+# memory
+tikv-jemalloc-sys = { version = "0.6", features = ["stats"] }
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+
+# config
+serde_yaml = "0.9"
+
+# utilities
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }

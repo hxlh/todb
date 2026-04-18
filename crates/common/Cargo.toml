@@ -1,0 +1,11 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+bytes = { workspace = true }
