@@ -31,11 +31,10 @@ pub struct RpcConfig {
 
 impl Config {
     pub fn load(path: &str) -> crate::Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| crate::Error::Known {
-                code: crate::ErrorCode::Config,
-                message: format!("failed to read config file {}: {}", path, e),
-            })?;
+        let content = std::fs::read_to_string(path).map_err(|e| crate::Error::Known {
+            code: crate::ErrorCode::Config,
+            message: format!("failed to read config file {}: {}", path, e),
+        })?;
         serde_yaml::from_str(&content).map_err(|e| crate::Error::Known {
             code: crate::ErrorCode::Config,
             message: format!("failed to parse config: {}", e),

@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use axum::{Json, extract::State, extract::rejection::JsonRejection, http::StatusCode, response::IntoResponse};
+use axum::{
+    Json, extract::State, extract::rejection::JsonRejection, http::StatusCode,
+    response::IntoResponse,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::query::QueryEngine;

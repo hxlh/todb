@@ -1,7 +1,7 @@
-use sql::{udf::VersionInfo, create_session_context, udf::register_version_udf};
+use sql::{create_session_context, udf::VersionInfo, udf::register_version_udf};
 
 #[tokio::test]
-async fn version_udf_returns_single_value() {
+async fn test_version_udf_returns_single_value() {
     let ctx = create_session_context();
     register_version_udf(
         &ctx,

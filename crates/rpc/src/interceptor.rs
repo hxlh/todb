@@ -1,5 +1,5 @@
-use tonic::service::Interceptor;
 use tonic::Status;
+use tonic::service::Interceptor;
 
 #[derive(Clone)]
 pub struct TraceInterceptor;

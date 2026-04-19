@@ -22,14 +22,13 @@ impl MetricsCollector {
             message: format!("failed to create rpc_duration metric: {}", e),
         })?;
 
-        let rpc_requests_total = IntCounter::new(
-            "todb_rpc_requests_total",
-            "Total number of RPC requests",
-        )
-        .map_err(|e| common::Error::Known {
-            code: common::ErrorCode::Internal,
-            message: format!("failed to create rpc_requests_total metric: {}", e),
-        })?;
+        let rpc_requests_total =
+            IntCounter::new("todb_rpc_requests_total", "Total number of RPC requests").map_err(
+                |e| common::Error::Known {
+                    code: common::ErrorCode::Internal,
+                    message: format!("failed to create rpc_requests_total metric: {}", e),
+                },
+            )?;
 
         let rpc_active = IntGauge::new("todb_rpc_active", "Number of active RPC requests")
             .map_err(|e| common::Error::Known {

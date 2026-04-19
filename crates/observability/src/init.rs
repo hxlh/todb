@@ -14,12 +14,15 @@ pub struct ObservabilityConfig {
 
 pub fn init_observability(config: &ObservabilityConfig) -> common::Result<MetricsCollector> {
     // Build env filter
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.log_level));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.log_level));
 
     // Build tracer provider if OTLP enabled
     let tracer = if config.enable_otlp {
-        let endpoint = config.otlp_endpoint.as_deref().unwrap_or("http://localhost:4317");
+        let endpoint = config
+            .otlp_endpoint
+            .as_deref()
+            .unwrap_or("http://localhost:4317");
         TracerProvider::build_otlp(endpoint, &config.service_name).ok()
     } else {
         None

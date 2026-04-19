@@ -4,7 +4,10 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::display::array_value_to_string;
 use serde::Serialize;
 use serde_json::{Map, Number, Value};
-use sql::{create_session_context, udf::VersionInfo, udf::register_version_udf};
+use sql::{
+    catalog::register_system_catalog, create_session_context, udf::VersionInfo,
+    udf::register_version_udf,
+};
 
 use crate::version::BuildVersion;
 
@@ -32,8 +35,9 @@ pub struct QueryEngine {
 }
 
 impl QueryEngine {
-    pub fn new(build_version: BuildVersion) -> Result<Self> {
+    pub fn new(build_version: BuildVersion, system_table_dir: &std::path::Path) -> Result<Self> {
         let ctx = create_session_context();
+        register_system_catalog(&ctx, system_table_dir)?;
         register_version_udf(
             &ctx,
             VersionInfo {
@@ -128,17 +132,28 @@ fn rendered_value_to_json(rendered: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use serde_json::json;
 
     use super::{QueryEngine, execute_query};
     use crate::version::BuildVersion;
 
+    fn system_table_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("bootstrap/system_tables.yaml")
+    }
+
     #[tokio::test]
-    async fn execute_query_accepts_select_version() {
-        let engine = QueryEngine::new(BuildVersion {
-            commit_short: "abc1234".to_string(),
-            build_time: "20260418215711".to_string(),
-        })
+    async fn test_execute_query_accepts_select_version() {
+        let engine = QueryEngine::new(
+            BuildVersion {
+                commit_short: "abc1234".to_string(),
+                build_time: "20260418215711".to_string(),
+            },
+            &system_table_dir(),
+        )
         .expect("create query engine");
 
         let response = execute_query(&engine, "select version() as version")
@@ -150,19 +165,24 @@ mod tests {
         assert_eq!(response.schema[0].data_type, "Utf8");
         assert_eq!(
             response.data,
-            vec![json!({"version": "abc1234-20260418215711"})
-                .as_object()
-                .unwrap()
-                .clone()]
+            vec![
+                json!({"version": "abc1234-20260418215711"})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            ]
         );
     }
 
     #[tokio::test]
-    async fn execute_query_supports_general_projection_output() {
-        let engine = QueryEngine::new(BuildVersion {
-            commit_short: "abc1234".to_string(),
-            build_time: "20260418215711".to_string(),
-        })
+    async fn test_execute_query_supports_general_projection_output() {
+        let engine = QueryEngine::new(
+            BuildVersion {
+                commit_short: "abc1234".to_string(),
+                build_time: "20260418215711".to_string(),
+            },
+            &system_table_dir(),
+        )
         .expect("create query engine");
 
         let response = execute_query(&engine, "select 'Alice' as name, 30 as age")
@@ -176,10 +196,48 @@ mod tests {
         assert_eq!(response.schema[1].data_type, "Int64");
         assert_eq!(
             response.data,
-            vec![json!({"name": "Alice", "age": 30})
-                .as_object()
-                .unwrap()
-                .clone()]
+            vec![
+                json!({"name": "Alice", "age": 30})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_query_supports_system_types_table() {
+        let engine = QueryEngine::new(
+            BuildVersion {
+                commit_short: "abc1234".to_string(),
+                build_time: "20260418215711".to_string(),
+            },
+            &system_table_dir(),
+        )
+        .expect("create query engine");
+
+        let response = execute_query(
+            &engine,
+            "select type_name, category from system.types order by type_id limit 2",
+        )
+        .await
+        .expect("execute query");
+
+        assert_eq!(response.schema.len(), 2);
+        assert_eq!(response.schema[0].name, "type_name");
+        assert_eq!(response.schema[1].name, "category");
+        assert_eq!(
+            response.data,
+            vec![
+                json!({"type_name": "Boolean", "category": "boolean"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                json!({"type_name": "Int8", "category": "numeric"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ]
         );
     }
 }

@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_CONTEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -16,7 +16,7 @@ impl MemoryContextId {
 pub struct MemoryContext {
     id: MemoryContextId,
     name: String,
-    parent: Option<MemoryContextId>,
+    _parent: Option<MemoryContextId>,
     allocated: AtomicU64,
 }
 
@@ -25,7 +25,7 @@ impl MemoryContext {
         Self {
             id: MemoryContextId::next(),
             name: name.into(),
-            parent,
+            _parent: parent,
             allocated: AtomicU64::new(0),
         }
     }
@@ -72,7 +72,11 @@ impl MemoryContextTree {
         &self.root
     }
 
-    pub fn create_child(&mut self, name: impl Into<String>, parent: MemoryContextId) -> Option<Arc<MemoryContext>> {
+    pub fn create_child(
+        &mut self,
+        name: impl Into<String>,
+        parent: MemoryContextId,
+    ) -> Option<Arc<MemoryContext>> {
         if !self.contexts.contains_key(&parent) {
             return None;
         }
