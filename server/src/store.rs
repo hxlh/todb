@@ -54,6 +54,18 @@ impl TableStore {
         table.append(batch)
     }
 
+    pub fn drop_table(&self, table_id: impl AsRef<str>) -> Result<()> {
+        let table_id = table_id.as_ref().to_string();
+        let mut tables = self
+            .tables
+            .write()
+            .map_err(|_| anyhow!("table store write lock poisoned"))?;
+        tables
+            .remove(&table_id)
+            .ok_or_else(|| anyhow!("table not found: {table_id}"))?;
+        Ok(())
+    }
+
     pub fn table(&self, table_id: &str) -> Option<Arc<InMemoryTableData>> {
         let tables = self.tables.read().ok()?;
         tables.get(table_id).cloned()
@@ -70,6 +82,14 @@ impl InMemoryTableData {
             .write()
             .map_err(|_| anyhow!("table batch write lock poisoned"))?
             .push(batch);
+        Ok(())
+    }
+
+    pub fn replace_batches(&self, new_batches: Vec<RecordBatch>) -> Result<()> {
+        *self
+            .batches
+            .write()
+            .map_err(|_| anyhow!("table batch write lock poisoned"))? = new_batches;
         Ok(())
     }
 
@@ -91,5 +111,13 @@ impl InMemoryTableData {
 
     pub fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+
+    pub fn batches(&self) -> Result<Vec<RecordBatch>> {
+        Ok(self
+            .batches
+            .read()
+            .map_err(|_| anyhow!("table batch read lock poisoned"))?
+            .clone())
     }
 }

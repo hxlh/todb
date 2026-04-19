@@ -6,7 +6,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 
 #[derive(Debug)]
 pub struct CatalogManager {
-    databases: RwLock<HashMap<String, DatabaseMeta>>,
+    pub databases: RwLock<HashMap<String, DatabaseMeta>>,
 }
 
 #[derive(Debug, Clone)]

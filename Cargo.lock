@@ -3070,9 +3070,11 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "chrono",
  "datafusion",
+ "futures",
  "pgwire",
  "serde",
  "serde_json",

@@ -11,4 +11,5 @@ mod store;
 pub use catalog::CatalogManager;
 pub use client_session::ClientSession;
 pub use engine::EngineState;
+pub use executor::{ExecutionResult, QueryExecutor};
 pub use store::TableStore;
