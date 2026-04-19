@@ -6,17 +6,16 @@ build = "build.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-axum = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+datafusion = { workspace = true }
+pgwire = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sql = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
-datafusion = { workspace = true }
 
 [build-dependencies]
 chrono = { workspace = true }
-
-[dev-dependencies]
-reqwest = { workspace = true }
