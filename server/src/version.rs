@@ -24,13 +24,13 @@ mod tests {
     use super::format_version_string;
 
     #[test]
-    fn formats_short_sha_and_build_time() {
+    fn test_formats_short_sha_and_build_time() {
         let rendered = format_version_string("abc1234", "20260418215711");
         assert_eq!(rendered, "abc1234-20260418215711");
     }
 
     #[test]
-    fn keeps_unknown_fallback_when_commit_missing() {
+    fn test_keeps_unknown_fallback_when_commit_missing() {
         let rendered = format_version_string("unknown", "00000000000000");
         assert_eq!(rendered, "unknown-00000000000000");
     }

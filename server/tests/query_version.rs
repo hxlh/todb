@@ -2,7 +2,7 @@ use reqwest::StatusCode;
 use serde_json::json;
 
 #[tokio::test]
-async fn post_query_returns_version_json() {
+async fn test_post_query_returns_version_json() {
     let (address, _handle) = server::start_for_test().await.expect("start test server");
 
     let client = reqwest::Client::new();
@@ -29,7 +29,7 @@ async fn post_query_returns_version_json() {
 }
 
 #[tokio::test]
-async fn post_query_supports_general_output_shape() {
+async fn test_post_query_supports_general_output_shape() {
     let (address, _handle) = server::start_for_test().await.expect("start test server");
 
     let client = reqwest::Client::new();
@@ -59,7 +59,34 @@ async fn post_query_supports_general_output_shape() {
 }
 
 #[tokio::test]
-async fn post_query_rejects_invalid_json() {
+async fn test_post_query_supports_system_join() {
+    let (address, _handle) = server::start_for_test().await.expect("start test server");
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{address}/query"))
+        .json(&json!({
+            "sql": "select d.database_name, t.table_name from system.tables t join system.databases d on t.database_id = d.database_id order by t.table_id"
+        }))
+        .send()
+        .await
+        .expect("send request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("read json");
+    assert_eq!(
+        body["data"],
+        json!([
+            { "database_name": "system", "table_name": "types" },
+            { "database_name": "system", "table_name": "databases" },
+            { "database_name": "system", "table_name": "tables" },
+            { "database_name": "system", "table_name": "columns" }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn test_post_query_rejects_invalid_json() {
     let (address, _handle) = server::start_for_test().await.expect("start test server");
 
     let client = reqwest::Client::new();

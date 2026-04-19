@@ -4,7 +4,10 @@ use opentelemetry_otlp::WithExportConfig;
 pub struct TracerProvider;
 
 impl TracerProvider {
-    pub fn build_otlp(endpoint: &str, service_name: &str) -> common::Result<opentelemetry_sdk::trace::Tracer> {
+    pub fn build_otlp(
+        endpoint: &str,
+        service_name: &str,
+    ) -> common::Result<opentelemetry_sdk::trace::Tracer> {
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
             .with_endpoint(endpoint)

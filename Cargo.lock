@@ -3173,6 +3173,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "datafusion",
+ "serde",
+ "serde_yaml",
+ "tempfile",
  "tokio",
 ]
 

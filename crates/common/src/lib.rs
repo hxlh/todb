@@ -1,4 +1,4 @@
-pub mod error;
 pub mod config;
+pub mod error;
 
-pub use error::{ErrorCode, Error, Result};
+pub use error::{Error, ErrorCode, Result};
