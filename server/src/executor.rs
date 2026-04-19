@@ -48,9 +48,10 @@ impl QueryExecutor {
         }
     }
 
-    fn build_session_context(engine: &EngineState) -> Result<datafusion::execution::context::SessionContext> {
-        let config = SessionConfig::new()
-            .with_information_schema(true);
+    fn build_session_context(
+        engine: &EngineState,
+    ) -> Result<datafusion::execution::context::SessionContext> {
+        let config = SessionConfig::new().with_information_schema(true);
         let ctx = datafusion::execution::context::SessionContext::new_with_config(config);
 
         let system_table_dir = default_system_table_dir();
@@ -82,16 +83,19 @@ impl QueryExecutor {
         let database = "default";
 
         if engine.catalog.table(database, &table_name).is_some() {
-            return Err(anyhow::anyhow!("table already exists: {database}.{table_name}"));
+            return Err(anyhow::anyhow!(
+                "table already exists: {database}.{table_name}"
+            ));
         }
 
-        let schema = ctx
-            .table_provider(&table_name)
-            .await?
-            .schema();
+        let schema = ctx.table_provider(&table_name).await?.schema();
 
-        engine.catalog.create_table(database, &table_name, schema.clone())?;
-        engine.store.create_table(format!("{database}.{table_name}"), schema)?;
+        engine
+            .catalog
+            .create_table(database, &table_name, schema.clone())?;
+        engine
+            .store
+            .create_table(format!("{database}.{table_name}"), schema)?;
 
         Ok(ExecutionResult::CommandComplete {
             tag: "CREATE TABLE".to_string(),
@@ -109,7 +113,9 @@ impl QueryExecutor {
         let database = "default";
 
         engine.catalog.drop_table(database, &table_name)?;
-        engine.store.drop_table(format!("{database}.{table_name}"))?;
+        engine
+            .store
+            .drop_table(format!("{database}.{table_name}"))?;
 
         Ok(ExecutionResult::CommandComplete {
             tag: "DROP TABLE".to_string(),
@@ -184,9 +190,7 @@ impl QueryExecutor {
         let schema = batches
             .first()
             .map(|b| b.schema())
-            .unwrap_or_else(|| {
-                std::sync::Arc::new(datafusion::arrow::datatypes::Schema::empty())
-            });
+            .unwrap_or_else(|| std::sync::Arc::new(datafusion::arrow::datatypes::Schema::empty()));
 
         Ok(ExecutionResult::Query { schema, batches })
     }
@@ -247,13 +251,13 @@ fn register_user_tables(
         Err(_) => return,
     };
 
-    for (_db_name, db_meta) in databases.iter() {
-        for (table_name, _table_meta) in &db_meta.tables {
+    for db_meta in databases.values() {
+        for table_name in db_meta.tables.keys() {
             let table_key = format!("{}.{}", db_meta.name, table_name);
-            if let Some(table_data) = engine.store.table(&table_key) {
-                if let Ok(mem_table) = table_data.mem_table() {
-                    let _ = ctx.register_table(table_name.clone(), mem_table);
-                }
+            if let Some(table_data) = engine.store.table(&table_key)
+                && let Ok(mem_table) = table_data.mem_table()
+            {
+                let _ = ctx.register_table(table_name.clone(), mem_table);
             }
         }
     }
@@ -269,12 +273,7 @@ async fn scan_mem_table_batches(
     for i in 0..scan_plan.output_partitioning().partition_count() {
         let mut stream = scan_plan.execute(i, task_ctx.clone())?;
         loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                stream.next(),
-            )
-            .await
-            {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), stream.next()).await {
                 Ok(Some(batch)) => all_batches.push(batch?),
                 Ok(None) => break,
                 Err(_) => anyhow::bail!("timeout scanning mem table"),

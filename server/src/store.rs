@@ -19,6 +19,12 @@ pub struct InMemoryTableData {
     batches: RwLock<Vec<RecordBatch>>,
 }
 
+impl Default for TableStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TableStore {
     pub fn new() -> Self {
         Self {
@@ -101,12 +107,16 @@ impl InMemoryTableData {
     }
 
     pub fn mem_table(&self) -> Result<Arc<MemTable>> {
-        let partitions = vec![self
-            .batches
-            .read()
-            .map_err(|_| anyhow!("table batch read lock poisoned"))?
-            .clone()];
-        Ok(Arc::new(MemTable::try_new(self.schema.clone(), partitions)?))
+        let partitions = vec![
+            self.batches
+                .read()
+                .map_err(|_| anyhow!("table batch read lock poisoned"))?
+                .clone(),
+        ];
+        Ok(Arc::new(MemTable::try_new(
+            self.schema.clone(),
+            partitions,
+        )?))
     }
 
     pub fn schema(&self) -> SchemaRef {

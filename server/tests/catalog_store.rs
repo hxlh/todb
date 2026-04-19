@@ -30,9 +30,7 @@ fn create_and_drop_table_updates_catalog() {
     let table = catalog.table("default", "people").expect("table exists");
     assert_eq!(table.name, "people");
 
-    catalog
-        .drop_table("default", "people")
-        .expect("drop table");
+    catalog.drop_table("default", "people").expect("drop table");
     assert!(catalog.table("default", "people").is_none());
 }
 
@@ -53,9 +51,7 @@ fn append_rows_updates_table_store() {
     )
     .expect("build batch");
 
-    store
-        .append("default.people", batch)
-        .expect("append batch");
+    store.append("default.people", batch).expect("append batch");
     let rows = store
         .table("default.people")
         .expect("table data")

@@ -5,8 +5,8 @@ pub mod engine;
 pub mod error;
 pub mod executor;
 pub mod pgwire;
-pub mod version;
 mod store;
+pub mod version;
 
 pub use catalog::CatalogManager;
 pub use client_session::ClientSession;

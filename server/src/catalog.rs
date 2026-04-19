@@ -22,6 +22,12 @@ pub struct TableMeta {
     pub schema: SchemaRef,
 }
 
+impl Default for CatalogManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CatalogManager {
     pub fn new() -> Self {
         let mut databases = HashMap::new();

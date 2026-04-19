@@ -1,6 +1,6 @@
-use server::{ClientSession, EngineState, QueryExecutor};
 use server::executor::ExecutionResult;
 use server::version::BuildVersion;
+use server::{ClientSession, EngineState, QueryExecutor};
 
 fn test_engine() -> EngineState {
     EngineState::new(BuildVersion {
@@ -35,17 +35,18 @@ async fn insert_then_select_roundtrip() {
     let engine = test_engine();
     let session = ClientSession::new("default");
 
-    QueryExecutor::execute(&engine, &session, "CREATE TABLE people(name VARCHAR, age INT)")
-        .await
-        .expect("create table");
-
-    let result = QueryExecutor::execute(
+    QueryExecutor::execute(
         &engine,
         &session,
-        "INSERT INTO people VALUES ('Alice', 30)",
+        "CREATE TABLE people(name VARCHAR, age INT)",
     )
     .await
-    .expect("insert");
+    .expect("create table");
+
+    let result =
+        QueryExecutor::execute(&engine, &session, "INSERT INTO people VALUES ('Alice', 30)")
+            .await
+            .expect("insert");
 
     match result {
         ExecutionResult::AffectedRows { rows } => {
