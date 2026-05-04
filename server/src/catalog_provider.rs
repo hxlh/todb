@@ -66,7 +66,6 @@ impl CatalogProvider for TodbCatalogProvider {
     }
 }
 
-
 pub struct TodbCatalogProviderList {
     catalogs: RwLock<HashMap<String, Arc<dyn CatalogProvider>>>,
 }

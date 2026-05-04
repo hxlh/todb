@@ -147,13 +147,9 @@ async fn set_time_zone_returns_command_complete() {
     let engine = test_engine();
     let session = ClientSession::new("default");
 
-    let result = QueryExecutor::execute(
-        &engine,
-        &session,
-        r#"SET TIME ZONE "Asia/Shanghai""#,
-    )
-    .await
-    .expect("execute set time zone");
+    let result = QueryExecutor::execute(&engine, &session, r#"SET TIME ZONE "Asia/Shanghai""#)
+        .await
+        .expect("execute set time zone");
 
     match result {
         ExecutionResult::CommandComplete { tag } => {
