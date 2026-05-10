@@ -79,3 +79,56 @@ impl BlockWriter for FileBlockWriter {
         Ok(BlockHandle { offset, size })
     }
 }
+
+/// Abstraction over block read sources (file, memory, etc.).
+pub trait BlockReader {
+    fn read_block(&self, handle: BlockHandle) -> StorageResult<Bytes>;
+}
+
+/// In-memory block reader for testing.
+/// Reads blocks from a shared `Bytes` buffer using offset/size handles.
+pub struct InMemoryBlockReader {
+    buf: Bytes,
+}
+
+impl InMemoryBlockReader {
+    pub fn new(buf: Bytes) -> Self {
+        Self { buf }
+    }
+}
+
+impl BlockReader for InMemoryBlockReader {
+    fn read_block(&self, handle: BlockHandle) -> StorageResult<Bytes> {
+        let start = handle.offset as usize;
+        let end = start + handle.size as usize;
+        if end > self.buf.len() {
+            return Err(crate::errors::StorageError::InvalidKey(
+                "block handle out of bounds".into(),
+            ));
+        }
+        Ok(self.buf.slice(start..end))
+    }
+}
+
+/// File-based block reader for production.
+pub struct FileBlockReader {
+    file: std::fs::File,
+}
+
+impl FileBlockReader {
+    pub fn open(path: &Path) -> StorageResult<Self> {
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
+        Ok(Self { file })
+    }
+}
+
+impl BlockReader for FileBlockReader {
+    fn read_block(&self, handle: BlockHandle) -> StorageResult<Bytes> {
+        use std::io::{Read, Seek};
+        let mut file = &self.file;
+        file.seek(std::io::SeekFrom::Start(handle.offset))?;
+        let mut buf = vec![0u8; handle.size as usize];
+        file.read_exact(&mut buf)?;
+        Ok(Bytes::from(buf))
+    }
+}
