@@ -3315,6 +3315,8 @@ dependencies = [
  "bytes",
  "crossbeam-skiplist",
  "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,7 +1,6 @@
-use crate::errors::{StorageError, StorageResult};
+use crate::errors::StorageResult;
 
-
-pub enum RowValue{
+pub enum RowValue {
     Null,
     Bool(bool),
     Int64(i64),
@@ -38,8 +37,8 @@ impl RowValue {
         }
     }
 
-    pub fn decode(data: &[u8],tp: RowValue) -> StorageResult<RowValue> {
-        let res=match tp {
+    pub fn decode(data: &[u8], tp: RowValue) -> StorageResult<RowValue> {
+        let res = match tp {
             RowValue::Null => RowValue::Null,
             RowValue::Bool(_) => RowValue::Bool(data[0] == 1),
             RowValue::Int64(_) => {
@@ -64,4 +63,3 @@ impl RowValue {
 pub struct RowData {
     pub values: Vec<RowValue>,
 }
-

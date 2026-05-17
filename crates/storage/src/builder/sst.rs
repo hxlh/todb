@@ -1,10 +1,33 @@
 use bytes::Bytes;
+use tracing::debug;
 
 use crate::{
     block::{BlockHandle, BlockWriter},
     builder::{data_block::DataBlockBuilder, index_block::IndexBlockBuilder},
-    errors::StorageResult,
+    errors::{StorageError, StorageResult},
 };
+
+/// Options for SST construction. Use `SstOption::default()` for sensible defaults,
+/// then override fields via builder-style methods.
+#[derive(Debug, Clone)]
+pub struct SstOption {
+    pub block_size: usize,
+}
+
+impl Default for SstOption {
+    fn default() -> Self {
+        Self {
+            block_size: 64 * 1024,
+        }
+    }
+}
+
+impl SstOption {
+    pub fn block_size(mut self, size: usize) -> Self {
+        self.block_size = size;
+        self
+    }
+}
 
 /// Streaming SST builder.
 ///
@@ -16,14 +39,16 @@ pub struct SstBuilder<W: BlockWriter> {
     writer: W,
     data_builder: DataBlockBuilder,
     index_builders: Vec<IndexBlockBuilder>,
+    option: SstOption,
 }
 
 impl<W: BlockWriter> SstBuilder<W> {
-    pub fn new(writer: W) -> Self {
+    pub fn new(writer: W, option: SstOption) -> Self {
         Self {
-            writer,
-            data_builder: DataBlockBuilder::new(),
+            data_builder: DataBlockBuilder::new(&option),
             index_builders: Vec::new(),
+            writer,
+            option,
         }
     }
 
@@ -46,7 +71,8 @@ impl<W: BlockWriter> SstBuilder<W> {
             .cloned()
             .unwrap_or_else(|| Bytes::new());
         let block = self.data_builder.finish();
-        let handle = self.writer.write_block(block)?;
+        let handle = self.writer.write_block(&block)?;
+        debug!("new data block");
         self.add_index_entry(0, end_key, handle)
     }
 
@@ -57,13 +83,16 @@ impl<W: BlockWriter> SstBuilder<W> {
         handle: BlockHandle,
     ) -> StorageResult<()> {
         if level >= self.index_builders.len() {
-            self.index_builders.push(IndexBlockBuilder::new());
+            self.index_builders
+                .push(IndexBlockBuilder::new(&self.option));
         }
         if self.index_builders[level].would_exceed(&end_key, &handle) {
             self.flush_index_block(level)?;
         }
         let builder = &mut self.index_builders[level];
         builder.add(end_key, handle);
+
+        debug!("add_index_entry: level={}", level);
         Ok(())
     }
 
@@ -77,12 +106,16 @@ impl<W: BlockWriter> SstBuilder<W> {
             .map(|e| e.end_key.clone())
             .unwrap_or_else(|| Bytes::new());
         let block = builder.finish();
-        let handle = self.writer.write_block(block)?;
+        let handle = self.writer.write_block(&block)?;
+
+        debug!("flush_index_block: level={}", level);
         self.add_index_entry(level + 1, end_key, handle)
     }
 
     /// Finalize the SST and return `(footer, writer)`.
     pub fn finish(mut self) -> StorageResult<(SstFooter, W)> {
+        debug!("sst builder finish");
+
         self.flush_data_block()?;
 
         // Flush all pending index levels bottom-up
@@ -92,20 +125,22 @@ impl<W: BlockWriter> SstBuilder<W> {
             }
         }
 
-        if let Some(builder) = self.index_builders.last() {
-            if !builder.is_empty() {
-                self.flush_index_block(self.index_builders.len() - 1)?;
-            }
-        }
+        let height = self.index_builders.len() as u32;
 
-        let root_handle = self
+        let Some(root_handle) = self
             .index_builders
             .last()
             .and_then(|b| b.last_entry())
             .map(|e| e.child)
-            .unwrap_or(BlockHandle { offset: 0, size: 0 });
-
-        let height = self.index_builders.len() as u32 + 1;
+        else {
+            return Ok((
+                SstFooter {
+                    tree_height: height,
+                    root_handle: BlockHandle { offset: 0 },
+                },
+                self.writer,
+            ));
+        };
 
         let footer = SstFooter {
             root_handle,
@@ -135,55 +170,58 @@ mod tests {
         Bytes::from(format!("value_{}", i))
     }
 
+    fn default_builder() -> SstBuilder<InMemoryBlockWriter> {
+        SstBuilder::new(InMemoryBlockWriter::new(), SstOption::default())
+    }
+
     #[test]
     fn test_build_single_data_block() {
-        let writer = InMemoryBlockWriter::new();
-        let mut builder = SstBuilder::new(writer);
-
+        let mut builder = default_builder();
         for i in 0..10u64 {
             builder.add(make_key(i), make_value(i)).unwrap();
         }
-
         let (footer, _writer) = builder.finish().unwrap();
         assert!(footer.tree_height >= 1);
     }
 
     #[test]
     fn test_build_multi_block_with_index() {
-        let writer = InMemoryBlockWriter::new();
-        let mut builder = SstBuilder::new(writer);
-
-        // Write enough entries to trigger multiple data blocks
+        let mut builder = default_builder();
         for i in 0..10000u64 {
             builder.add(make_key(i), make_value(i)).unwrap();
         }
-
         let (footer, _writer) = builder.finish().unwrap();
         assert!(footer.tree_height >= 2);
     }
 
     #[test]
     fn test_build_produces_bytes() {
-        let writer = InMemoryBlockWriter::new();
-        let mut builder = SstBuilder::new(writer);
-
+        let mut builder = default_builder();
         for i in 0..100u64 {
             builder.add(make_key(i), make_value(i)).unwrap();
         }
-
         let (footer, writer) = builder.finish().unwrap();
         let buf = writer.into_inner();
         assert!(!buf.is_empty());
-        // Root block should be within the written bytes
-        let root_end = footer.root_handle.offset as usize + footer.root_handle.size as usize;
-        assert!(root_end <= buf.len());
+        assert!(footer.root_handle.offset < buf.len() as u64);
     }
 
     #[test]
     fn test_build_empty() {
-        let writer = InMemoryBlockWriter::new();
-        let builder = SstBuilder::new(writer);
+        let builder = default_builder();
         let (footer, _writer) = builder.finish().unwrap();
-        assert_eq!(footer.root_handle, BlockHandle { offset: 0, size: 0 });
+        assert_eq!(footer.root_handle, BlockHandle { offset: 0 });
+    }
+
+    #[test]
+    fn test_custom_block_size() {
+        // Small block_size forces multiple data blocks with fewer entries.
+        let option = SstOption::default().block_size(256);
+        let mut builder = SstBuilder::new(InMemoryBlockWriter::new(), option);
+        for i in 0..200u64 {
+            builder.add(make_key(i), make_value(i)).unwrap();
+        }
+        let (footer, _writer) = builder.finish().unwrap();
+        assert!(footer.tree_height >= 2);
     }
 }

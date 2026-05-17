@@ -8,3 +8,7 @@ license.workspace = true
 thiserror = { workspace = true }
 crossbeam-skiplist = { workspace = true }
 bytes = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

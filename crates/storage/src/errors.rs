@@ -4,6 +4,8 @@ pub type StorageResult<T> = Result<T, StorageError>;
 pub enum StorageError {
     #[error("invalid key: {0}")]
     InvalidKey(String),
+    #[error("invalid values: {0}")]
+    InvalidValue(String),
     #[error("row encode error: {0}")]
     RowEncodeError(String),
     #[error("transaction conflict: {0}")]
