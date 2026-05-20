@@ -116,10 +116,7 @@ pub struct InMemoryBlockReader {
 
 impl InMemoryBlockReader {
     pub fn new(buf: Bytes, block_size: usize) -> Self {
-        Self {
-            buf: buf,
-            block_size: block_size,
-        }
+        Self { buf, block_size }
     }
 }
 
