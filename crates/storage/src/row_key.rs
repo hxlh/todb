@@ -9,6 +9,10 @@ impl<'a> BinaryKey<'a> {
     pub fn from_slice<T: AsRef<[u8]> + ?Sized>(b: &'a T) -> Self {
         Self { buf: b.as_ref() }
     }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.buf
+    }
 }
 
 impl Eq for BinaryKey<'_> {}
