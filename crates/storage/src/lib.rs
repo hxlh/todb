@@ -7,3 +7,5 @@ pub mod row_data;
 pub mod row_key;
 #[cfg(test)]
 pub mod testing;
+#[cfg(test)]
+mod tests;

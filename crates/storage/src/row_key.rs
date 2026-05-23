@@ -15,6 +15,12 @@ impl<'a> BinaryKey<'a> {
     }
 }
 
+impl<'a> AsRef<[u8]> for BinaryKey<'a> {
+    fn as_ref(&self) -> &[u8] {
+        self.buf
+    }
+}
+
 impl Eq for BinaryKey<'_> {}
 
 impl<'a, 'b> PartialEq<BinaryKey<'b>> for BinaryKey<'a> {
