@@ -5,17 +5,17 @@ use bytes::Bytes;
 use crate::{
     block::{InMemoryBlockReader, InMemoryBlockWriter},
     builder::{SstBuilder, SstOption},
-    iterators::{iter::StorageIter, sst_iter::SstIter},
+    iterators::{block_iter::BlockIter, iter::StorageIter, sst_iter::SstIter},
     row_key::RowKey,
     testing::init_tracing,
 };
 
 use super::helpers::{build_sst, make_key, make_value};
 
-fn make_iter(n: u64, block_size: usize) -> SstIter<InMemoryBlockReader> {
+fn make_iter(n: u64, block_size: usize) -> SstIter<InMemoryBlockReader, BlockIter, BlockIter> {
     let (bytes, footer, option) = build_sst(n, block_size);
     let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(bytes), block_size));
-    SstIter::new(reader, footer, option).unwrap()
+    SstIter::<_, BlockIter, BlockIter>::new(reader, footer, option).unwrap()
 }
 
 // Empty SST: seek_to_first results in invalid.

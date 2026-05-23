@@ -6,7 +6,7 @@ use tracing::debug;
 
 use crate::{
     errors::StorageResult,
-    iterators::iter::StorageIter,
+    iterators::iter::{DataBlockIter, IndexBlockIter, StorageIter},
     row_key::{BinaryKey, RowKey},
 };
 
@@ -140,6 +140,20 @@ BlockIter
             self.curr_idx
         ));
         Ok(())
+    }
+}
+
+// BlockIter serves as both the default index block format and data block format.
+// Future formats implement these traits independently.
+impl IndexBlockIter for BlockIter {
+    fn from_block(block: bytes::Bytes) -> StorageResult<Self> {
+        BlockIter::new(block)
+    }
+}
+
+impl DataBlockIter for BlockIter {
+    fn from_block(block: bytes::Bytes) -> StorageResult<Self> {
+        BlockIter::new(block)
     }
 }
 

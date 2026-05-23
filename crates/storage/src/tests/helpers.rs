@@ -6,7 +6,7 @@ use bytes::Bytes;
 use crate::{
     block::{InMemoryBlockReader, InMemoryBlockWriter},
     builder::{SstBuilder, SstFooter, SstOption},
-    iterators::{iter::StorageIter, sst_iter::SstIter},
+    iterators::{block_iter::BlockIter, iter::StorageIter, sst_iter::SstIter},
 };
 
 pub fn make_key(i: u64) -> Bytes {
@@ -27,7 +27,7 @@ pub fn make_sst_iter(start: u64, end: u64) -> SstIter<InMemoryBlockReader> {
     let (footer, writer) = builder.finish().unwrap();
     let bytes = Bytes::from(writer.into_inner());
     let reader = Arc::new(InMemoryBlockReader::new(bytes, 256));
-    SstIter::new(reader, footer, option).unwrap()
+    SstIter::<_, BlockIter, BlockIter>::new(reader, footer, option).unwrap()
 }
 
 /// Build a raw SST buffer with n keys and return (bytes, footer, option).
