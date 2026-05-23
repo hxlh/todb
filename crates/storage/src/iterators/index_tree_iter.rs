@@ -1,29 +1,34 @@
-use std::{sync::Arc, thread::spawn};
+use std::sync::Arc;
 
 use crate::{
     block::{BlockHandle, BlockReader},
     builder::{SstFooter, SstOption},
     errors::{StorageError, StorageResult},
-    iterators::{block_iter::BlockIter, iter::StorageIter},
-    row_key::{BinaryKey, RowKey},
+    iterators::{block_iter::BlockIter, iter::{IndexBlockIter, StorageIter}},
+    row_key::RowKey,
 };
 
 use tracing::{debug, span};
 
 #[allow(dead_code)]
-pub struct IndexTreeIter<R: BlockReader> {
+pub struct IndexTreeIter<R, I: IndexBlockIter = BlockIter> {
     reader: Arc<R>,
     #[allow(dead_code)]
     option: SstOption,
     tree_height: usize,
     root_handle: BlockHandle,
-    /// One BlockIter per index level.
+    /// One iterator per index level; format determined by I.
     /// iters[0] = root, iters[tree_height-2] = leaf index level.
-    index_iters: Vec<BlockIter>,
+    index_iters: Vec<I>,
     curr_iter_idx: usize,
 }
 
-impl<R: BlockReader> IndexTreeIter<R> {
+impl<R, I> IndexTreeIter<R, I>
+where
+    R: BlockReader,
+    I: IndexBlockIter,
+    for<'a> BlockHandle: From<I::Value<'a>>,
+{
     pub fn new(reader: Arc<R>, footer: &SstFooter, option: &SstOption) -> StorageResult<Self> {
         let s = Self {
             reader,
@@ -46,7 +51,7 @@ impl<R: BlockReader> IndexTreeIter<R> {
         self.tree_height - 2
     }
 
-    fn inner_seek<'a>(&mut self, target: Option<&BinaryKey<'_>>) -> StorageResult<()> {
+    fn inner_seek<'a>(&mut self, target: Option<&I::Key<'a>>) -> StorageResult<()> {
         if self.tree_height <= 1 {
             // no index block
             return Ok(());
@@ -54,7 +59,7 @@ impl<R: BlockReader> IndexTreeIter<R> {
         self.reset();
 
         let root_block = self.reader.read_block(&self.root_handle)?;
-        let mut root_iter = BlockIter::new(root_block)?;
+        let mut root_iter = I::from_block(root_block)?;
         if let Some(target) = target {
             root_iter.seek(target)?;
         } else {
@@ -89,16 +94,15 @@ impl<R: BlockReader> IndexTreeIter<R> {
 
             // create child iter
             let block = self.reader.read_block(&next_level_handle)?;
-            let mut child_iter = BlockIter::new(block)?;
+            let mut child_iter = I::from_block(block)?;
             if let Some(target) = target {
                 child_iter.seek(target)?;
             } else {
                 child_iter.seek_to_first()?;
             }
             debug!(
-                "create level {} child_iter: {} curr_iters_size: {}",
+                "create level {} curr_iters_size: {}",
                 self.curr_iter_idx + 1,
-                child_iter,
                 self.index_iters.len() + 1
             );
             self.index_iters.push(child_iter);
@@ -114,15 +118,6 @@ impl<R: BlockReader> IndexTreeIter<R> {
         let last_index_level = self.last_index_level();
 
         while self.curr_iter_idx <= last_index_level {
-            let layer_span = span!(
-                tracing::Level::DEBUG,
-                "inner_next",
-                level = self.curr_iter_idx,
-                stack_size = self.index_iters.len(),
-                is_last = self.curr_iter_idx == last_index_level
-            );
-            let _enter = layer_span.enter();
-
             let curr_iter = &mut self.index_iters[self.curr_iter_idx];
             curr_iter.next()?;
             if !curr_iter.valid() {
@@ -149,12 +144,11 @@ impl<R: BlockReader> IndexTreeIter<R> {
 
             // create child iter
             let block = self.reader.read_block(&next_level_handle)?;
-            let mut child_iter = BlockIter::new(block)?;
+            let mut child_iter = I::from_block(block)?;
             child_iter.seek_to_first()?;
             debug!(
-                "create level {} child_iter: {} curr_iters_size: {}",
+                "create level {} curr_iters_size: {}",
                 self.curr_iter_idx + 1,
-                child_iter,
                 self.index_iters.len() + 1
             );
             self.index_iters.push(child_iter);
@@ -170,8 +164,13 @@ impl<R: BlockReader> IndexTreeIter<R> {
     }
 }
 
-impl<R: BlockReader> StorageIter for IndexTreeIter<R> {
-    type Key<'a> = RowKey<'a>;
+impl<R, I> StorageIter for IndexTreeIter<R, I>
+where
+    R: BlockReader,
+    I: IndexBlockIter,
+    for<'a> BlockHandle: From<I::Value<'a>>,
+{
+    type Key<'a> = I::Key<'a>;
     type Value<'a>
         = BlockHandle
     where
@@ -222,6 +221,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::IndexTreeIter;
+    use crate::iterators::block_iter::BlockIter;
     use crate::testing::init_tracing;
     use crate::{
         block::{BlockReader, InMemoryBlockReader, InMemoryBlockWriter},
@@ -251,7 +251,7 @@ mod tests {
     fn make_iter(n: u64, block_size: usize) -> IndexTreeIter<InMemoryBlockReader> {
         let (bytes, footer, option) = build_sst(n, block_size);
         let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(bytes), block_size));
-        IndexTreeIter::new(reader, &footer, &option).unwrap()
+        IndexTreeIter::<_, BlockIter>::new(reader, &footer, &option).unwrap()
     }
 
     // Empty SST has no index blocks; iter must be invalid after seek_to_first.
@@ -259,7 +259,7 @@ mod tests {
     fn test_empty_sst_is_invalid() {
         let (bytes, footer, option) = build_sst(0, 256);
         let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(bytes), 256));
-        let mut iter = IndexTreeIter::new(reader, &footer, &option).unwrap();
+        let mut iter = IndexTreeIter::<_, BlockIter>::new(reader, &footer, &option).unwrap();
         iter.seek_to_first().unwrap();
         assert!(!iter.valid());
     }
@@ -300,7 +300,8 @@ mod tests {
         init_tracing();
         let (bytes, footer, option) = build_sst(200, 256);
         let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(bytes), 256));
-        let mut iter = IndexTreeIter::new(reader.clone(), &footer, &option).unwrap();
+        let mut iter =
+            IndexTreeIter::<_, BlockIter>::new(reader.clone(), &footer, &option).unwrap();
 
         let target = make_key(100);
         iter.seek(&BinaryKey::from_slice(&target)).unwrap();

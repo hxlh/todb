@@ -1,3 +1,5 @@
+use bytes::Bytes;
+
 use crate::errors::StorageResult;
 
 pub trait StorageIter {
@@ -6,21 +8,23 @@ pub trait StorageIter {
     where
         Self: 'a;
 
-    /// True if positioned at a valid entry.
     fn valid(&self) -> bool;
-
-    /// Move to the first entry.
     fn seek_to_first(&mut self) -> StorageResult<()>;
-
-    /// Move to the first entry with key >= target.
     fn seek<'a>(&mut self, target: &Self::Key<'a>) -> StorageResult<()>;
-
-    /// Advance to the next entry.
     fn next(&mut self) -> StorageResult<()>;
-
-    /// Current key, or None when invalid.
     fn key(&self) -> Option<Self::Key<'_>>;
-
-    /// Current value, or None when invalid.
     fn value(&self) -> Option<Self::Value<'_>>;
+}
+
+/// Abstracts the format of an index block.
+/// Implementations yield (key, BlockHandle) pairs from raw block bytes.
+/// Different index formats (B+tree node, prefix-compressed, etc.) implement this.
+pub trait IndexBlockIter: StorageIter + Sized {
+    fn from_block(block: Bytes) -> StorageResult<Self>;
+}
+
+/// Abstracts the format of a data block.
+/// Implementations yield (key, value) pairs from raw block bytes.
+pub trait DataBlockIter: StorageIter + Sized {
+    fn from_block(block: Bytes) -> StorageResult<Self>;
 }

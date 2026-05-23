@@ -1,118 +1,120 @@
 use std::sync::Arc;
 
 use crate::{
-    block::BlockReader,
+    block::{BlockHandle, BlockReader},
     builder::{SstFooter, SstOption},
     errors::{StorageError, StorageResult},
-    iterators::{block_iter::BlockIter, index_tree_iter::IndexTreeIter, iter::StorageIter},
-    row_key::{BinaryKey, RowKey},
+    iterators::{
+        block_iter::BlockIter,
+        index_tree_iter::IndexTreeIter,
+        iter::{DataBlockIter, IndexBlockIter, StorageIter},
+    },
 };
 
-pub struct SstIter<R: BlockReader> {
+pub struct SstIter<R, I = BlockIter, D = BlockIter>
+where
+    R: BlockReader,
+    I: IndexBlockIter,
+    for<'a> BlockHandle: From<I::Value<'a>>,
+    D: DataBlockIter,
+{
     reader: Arc<R>,
     #[allow(dead_code)]
     option: SstOption,
-    footer: SstFooter,
-    index_iter: IndexTreeIter<R>,
-    data_iter: Option<BlockIter>,
+    index_iter: IndexTreeIter<R, I>,
+    data_iter: Option<D>,
 }
 
-impl<R: BlockReader> SstIter<R> {
+impl<R, I, D> SstIter<R, I, D>
+where
+    R: BlockReader,
+    I: IndexBlockIter,
+    for<'a> BlockHandle: From<I::Value<'a>>,
+    D: DataBlockIter,
+{
     pub fn new(reader: Arc<R>, footer: SstFooter, option: SstOption) -> StorageResult<Self> {
         Ok(Self {
-            index_iter: IndexTreeIter::new(reader.clone(), &footer, &option)?,
-            footer: footer,
-            option: option,
-            reader: reader,
+            index_iter: IndexTreeIter::<R, I>::new(reader.clone(), &footer, &option)?,
+            option,
+            reader,
             data_iter: None,
         })
     }
 }
 
-impl<R: BlockReader> StorageIter for SstIter<R> {
-    type Key<'a> = RowKey<'a>;
+impl<R, I, D> StorageIter for SstIter<R, I, D>
+where
+    R: BlockReader,
+    I: IndexBlockIter,
+    for<'a> BlockHandle: From<I::Value<'a>>,
+    D: DataBlockIter,
+    // Index and data block must share the same key type so seek targets are compatible.
+    // Key<'a> has no `where Self: 'a`, so for<'a> does not require I: 'static or D: 'static.
+    for<'a> I: StorageIter<Key<'a> = D::Key<'a>>,
+{
+    type Key<'a> = D::Key<'a>;
 
-    type Value<'a>
-        = &'a [u8]
-    where
-        Self: 'a;
+    type Value<'a> = D::Value<'a> where Self: 'a;
 
     fn valid(&self) -> bool {
-        if let Some(iter) = &self.data_iter {
-            return iter.valid();
-        }
-        false
+        self.data_iter.as_ref().map_or(false, |d| d.valid())
     }
 
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.index_iter.seek_to_first()?;
         if self.index_iter.valid() {
-            let data_block_handle = self.index_iter.value().ok_or_else(|| {
-                StorageError::InvalidValue(format!("index iter is valid, but value is none"))
+            let handle: BlockHandle = self.index_iter.value().ok_or_else(|| {
+                StorageError::InvalidValue("index iter valid but value is none".into())
             })?;
-
-            let block = self.reader.read_block(&data_block_handle)?;
-            let mut data_iter = BlockIter::new(block)?;
-            data_iter.seek_to_first()?;
-            self.data_iter = Some(data_iter);
+            let block = self.reader.read_block(&handle)?;
+            let mut d = D::from_block(block)?;
+            d.seek_to_first()?;
+            self.data_iter = Some(d);
         }
         Ok(())
     }
 
     fn seek<'a>(&mut self, target: &Self::Key<'a>) -> StorageResult<()> {
+        // target: &D::Key<'a> = &I::Key<'a> (enforced by the Key equality bound)
         self.index_iter.seek(target)?;
         if self.index_iter.valid() {
-            let data_block_handle = self.index_iter.value().ok_or_else(|| {
-                StorageError::InvalidValue(format!("index iter is valid, but value is none"))
+            let handle: BlockHandle = self.index_iter.value().ok_or_else(|| {
+                StorageError::InvalidValue("index iter valid but value is none".into())
             })?;
-
-            let block = self.reader.read_block(&data_block_handle)?;
-            let mut data_iter = BlockIter::new(block)?;
-            data_iter.seek(target)?;
-            self.data_iter = Some(data_iter);
+            let block = self.reader.read_block(&handle)?;
+            let mut d = D::from_block(block)?;
+            d.seek(target)?;
+            self.data_iter = Some(d);
         }
         Ok(())
     }
 
     fn next(&mut self) -> StorageResult<()> {
-        if let Some(iter) = &mut self.data_iter {
-            iter.next()?;
-
-            if !iter.valid() {
+        if let Some(d) = &mut self.data_iter {
+            d.next()?;
+            if !d.valid() {
                 self.index_iter.next()?;
-
                 if !self.index_iter.valid() {
                     return Ok(());
                 }
-
-                let data_block_handle = self.index_iter.value().ok_or_else(|| {
-                    StorageError::InvalidValue(format!("index iter is valid, but value is none"))
+                let handle: BlockHandle = self.index_iter.value().ok_or_else(|| {
+                    StorageError::InvalidValue("index iter valid but value is none".into())
                 })?;
-                let block = self.reader.read_block(&data_block_handle)?;
-                let mut data_iter = BlockIter::new(block)?;
-                data_iter.seek_to_first()?;
-                self.data_iter = Some(data_iter);
+                let block = self.reader.read_block(&handle)?;
+                let mut d = D::from_block(block)?;
+                d.seek_to_first()?;
+                self.data_iter = Some(d);
             }
         }
         Ok(())
     }
 
     fn key(&self) -> Option<Self::Key<'_>> {
-        if self.valid() {
-            if let Some(iter) = &self.data_iter {
-                return iter.key();
-            }
-        }
-        None
+        self.data_iter.as_ref()?.key()
     }
 
     fn value(&self) -> Option<Self::Value<'_>> {
-        if self.valid() {
-            if let Some(iter) = &self.data_iter {
-                return iter.value();
-            }
-        }
-        None
+        self.data_iter.as_ref()?.value()
     }
 }
 
@@ -125,7 +127,7 @@ mod tests {
     use crate::{
         block::{InMemoryBlockReader, InMemoryBlockWriter},
         builder::{SstBuilder, SstFooter, SstOption},
-        iterators::iter::StorageIter,
+        iterators::{block_iter::BlockIter, iter::StorageIter},
         row_key::RowKey,
         testing::init_tracing,
     };
@@ -150,10 +152,10 @@ mod tests {
         (writer.into_inner(), footer, option)
     }
 
-    fn make_iter(n: u64, block_size: usize) -> SstIter<InMemoryBlockReader> {
+    fn make_iter(n: u64, block_size: usize) -> SstIter<InMemoryBlockReader, BlockIter, BlockIter> {
         let (bytes, footer, option) = build_sst(n, block_size);
         let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(bytes), block_size));
-        SstIter::new(reader, footer, option).unwrap()
+        SstIter::<_, BlockIter, BlockIter>::new(reader, footer, option).unwrap()
     }
 
     // 空 SST seek_to_first 后 valid() 应为 false

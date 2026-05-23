@@ -1,4 +1,4 @@
-mod block_iter;
+pub mod block_iter;
 pub mod concat_iter;
 mod index_tree_iter;
 pub mod iter;
