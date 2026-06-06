@@ -4,14 +4,18 @@ use crate::{
     block::{BlockHandle, BlockReader},
     builder::{SstFooter, SstOption},
     errors::{StorageError, StorageResult},
-    iterators::{block_iter::BlockIter, iter::{IndexBlockIter, StorageIter}},
+    iterators::{
+        block_iter::NormalBlockIter,
+        index_entry_decode_iter::IndexEntryDecodeIter,
+        iter::{AsArray, IndexBlockIter, StorageIter},
+    },
     row_key::RowKey,
 };
 
 use tracing::{debug, span};
 
 #[allow(dead_code)]
-pub struct IndexTreeIter<R, I: IndexBlockIter = BlockIter> {
+pub struct IndexTreeIter<R, I: IndexBlockIter = NormalBlockIter> {
     reader: Arc<R>,
     #[allow(dead_code)]
     option: SstOption,
@@ -19,7 +23,7 @@ pub struct IndexTreeIter<R, I: IndexBlockIter = BlockIter> {
     root_handle: BlockHandle,
     /// One iterator per index level; format determined by I.
     /// iters[0] = root, iters[tree_height-2] = leaf index level.
-    index_iters: Vec<I>,
+    index_iters: Vec<IndexEntryDecodeIter<I>>,
     curr_iter_idx: usize,
 }
 
@@ -27,7 +31,7 @@ impl<R, I> IndexTreeIter<R, I>
 where
     R: BlockReader,
     I: IndexBlockIter,
-    for<'a> BlockHandle: From<I::Value<'a>>,
+    for<'a> I::Value<'a>: AsArray<'a>,
 {
     pub fn new(reader: Arc<R>, footer: &SstFooter, option: &SstOption) -> StorageResult<Self> {
         let s = Self {
@@ -59,7 +63,7 @@ where
         self.reset();
 
         let root_block = self.reader.read_block(&self.root_handle)?;
-        let mut root_iter = I::from_block(root_block)?;
+        let mut root_iter = IndexEntryDecodeIter::new(I::from_block(root_block)?);
         if let Some(target) = target {
             root_iter.seek(target)?;
         } else {
@@ -94,7 +98,7 @@ where
 
             // create child iter
             let block = self.reader.read_block(&next_level_handle)?;
-            let mut child_iter = I::from_block(block)?;
+            let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
             if let Some(target) = target {
                 child_iter.seek(target)?;
             } else {
@@ -144,7 +148,7 @@ where
 
             // create child iter
             let block = self.reader.read_block(&next_level_handle)?;
-            let mut child_iter = I::from_block(block)?;
+            let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
             child_iter.seek_to_first()?;
             debug!(
                 "create level {} curr_iters_size: {}",
@@ -168,7 +172,7 @@ impl<R, I> StorageIter for IndexTreeIter<R, I>
 where
     R: BlockReader,
     I: IndexBlockIter,
-    for<'a> BlockHandle: From<I::Value<'a>>,
+    for<'a> I::Value<'a>: AsArray<'a>,
 {
     type Key<'a> = I::Key<'a>;
     type Value<'a>
@@ -221,7 +225,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::IndexTreeIter;
-    use crate::iterators::block_iter::BlockIter;
+    use crate::iterators::block_iter::NormalBlockIter;
     use crate::testing::init_tracing;
     use crate::{
         block::{BlockReader, InMemoryBlockReader, InMemoryBlockWriter},
@@ -251,7 +255,7 @@ mod tests {
     fn make_iter(n: u64, block_size: usize) -> IndexTreeIter<InMemoryBlockReader> {
         let (bytes, footer, option) = build_sst(n, block_size);
         let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(bytes), block_size));
-        IndexTreeIter::<_, BlockIter>::new(reader, &footer, &option).unwrap()
+        IndexTreeIter::<_, NormalBlockIter>::new(reader, &footer, &option).unwrap()
     }
 
     // Empty SST has no index blocks; iter must be invalid after seek_to_first.
@@ -259,7 +263,7 @@ mod tests {
     fn test_empty_sst_is_invalid() {
         let (bytes, footer, option) = build_sst(0, 256);
         let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(bytes), 256));
-        let mut iter = IndexTreeIter::<_, BlockIter>::new(reader, &footer, &option).unwrap();
+        let mut iter = IndexTreeIter::<_, NormalBlockIter>::new(reader, &footer, &option).unwrap();
         iter.seek_to_first().unwrap();
         assert!(!iter.valid());
     }
@@ -301,19 +305,19 @@ mod tests {
         let (bytes, footer, option) = build_sst(200, 256);
         let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(bytes), 256));
         let mut iter =
-            IndexTreeIter::<_, BlockIter>::new(reader.clone(), &footer, &option).unwrap();
+            IndexTreeIter::<_, NormalBlockIter>::new(reader.clone(), &footer, &option).unwrap();
 
         let target = make_key(100);
-        iter.seek(&BinaryKey::from_slice(&target)).unwrap();
+        iter.seek(&(&target).into()).unwrap();
         assert!(iter.valid());
 
         // The returned data block must actually contain key 100.
-        use crate::iterators::block_iter::BlockIter;
+        use crate::iterators::block_iter::NormalBlockIter;
         let block = reader.read_block(&iter.value().unwrap()).unwrap();
-        let mut bi = BlockIter::new(block).unwrap();
-        bi.seek(&BinaryKey::from_slice(&target)).unwrap();
+        let mut bi = NormalBlockIter::new(block).unwrap();
+        bi.seek(&(&target).into()).unwrap();
         assert!(bi.valid());
-        assert_eq!(bi.key().unwrap(), BinaryKey::from_slice(&target));
+        assert_eq!(bi.key().unwrap(), (&target).into());
     }
 
     // seek() past the last key must leave the iter invalid.
@@ -321,7 +325,31 @@ mod tests {
     fn test_seek_past_last_key_is_invalid() {
         let mut iter = make_iter(200, 256);
         let beyond = make_key(u64::MAX);
-        iter.seek(&BinaryKey::from_slice(&beyond)).unwrap();
+        iter.seek(&(&beyond).into()).unwrap();
         assert!(!iter.valid());
+    }
+
+    #[test]
+    fn invalid_index_entry_version_returns_error() {
+        let (bytes, footer, option) = build_sst(200, 256);
+        let mut raw = bytes;
+
+        let root_offset = footer.root_handle.offset as usize;
+        let root_block_len = 256.min(raw.len() - root_offset);
+        let root_block = &raw[root_offset..root_offset + root_block_len];
+        let count = u32::from_be_bytes(root_block[0..4].try_into().unwrap()) as usize;
+        assert!(count > 0);
+        let value_offset_pos = 4 + (count + 1) * 4;
+        let first_value_offset = u32::from_be_bytes(
+            root_block[value_offset_pos..value_offset_pos + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        raw[root_offset + first_value_offset] = 2;
+
+        let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(raw), 256));
+        let mut iter = IndexTreeIter::<_, NormalBlockIter>::new(reader, &footer, &option).unwrap();
+
+        assert!(iter.seek_to_first().is_err());
     }
 }

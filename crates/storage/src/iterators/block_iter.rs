@@ -6,12 +6,28 @@ use tracing::debug;
 
 use crate::{
     errors::StorageResult,
-    iterators::iter::{DataBlockIter, IndexBlockIter, StorageIter},
+    iterators::iter::{AsArray, DataBlockIter, IndexBlockIter, StorageIter},
     row_key::{BinaryKey, RowKey},
 };
 
+pub struct RawEntry<'a> {
+    buf: &'a [u8],
+}
+
+impl<'a> From<&'a [u8]> for RawEntry<'a> {
+    fn from(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+}
+
+impl<'a> AsArray<'a> for RawEntry<'a> {
+    fn as_array(&self) -> &'a [u8] {
+        self.buf
+    }
+}
+
 #[allow(dead_code)]
-pub struct BlockIter {
+pub struct NormalBlockIter {
     block: Bytes,
     key_offsets: Vec<usize>,
     values_offsets: Vec<usize>,
@@ -19,7 +35,7 @@ pub struct BlockIter {
     curr_idx: usize,
 }
 
-impl BlockIter {
+impl NormalBlockIter {
     pub fn new(block: Bytes) -> StorageResult<Self> {
         let mut s = Self {
             block,
@@ -70,10 +86,10 @@ impl BlockIter {
     }
 }
 
-impl StorageIter for BlockIter {
+impl StorageIter for NormalBlockIter {
     type Key<'a> = RowKey<'a>;
 
-    type Value<'a> = &'a [u8];
+    type Value<'a> = RawEntry<'a>;
 
     fn valid(&self) -> bool {
         self.count > 0 && self.curr_idx < self.count
@@ -109,7 +125,7 @@ impl StorageIter for BlockIter {
         if self.valid() {
             let start = self.key_offsets[self.curr_idx];
             let end = self.key_offsets[self.curr_idx + 1]; // sentinel always present
-            return Some(BinaryKey::from_slice(&self.block[start..end]));
+            return Some(BinaryKey::from(&self.block[start..end]));
         }
         None
     }
@@ -118,13 +134,13 @@ impl StorageIter for BlockIter {
         if self.valid() {
             let start = self.values_offsets[self.curr_idx];
             let end = self.values_offsets[self.curr_idx + 1]; // sentinel always present
-            return Some(&self.block[start..end]);
+            return Some(RawEntry::from(&self.block[start..end]));
         }
         None
     }
 }
 
-impl fmt::Display for BlockIter {
+impl fmt::Display for NormalBlockIter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let _ = f.write_fmt(format_args!(
             r#"
@@ -145,15 +161,15 @@ BlockIter
 
 // BlockIter serves as both the default index block format and data block format.
 // Future formats implement these traits independently.
-impl IndexBlockIter for BlockIter {
+impl IndexBlockIter for NormalBlockIter {
     fn from_block(block: bytes::Bytes) -> StorageResult<Self> {
-        BlockIter::new(block)
+        NormalBlockIter::new(block)
     }
 }
 
-impl DataBlockIter for BlockIter {
+impl DataBlockIter for NormalBlockIter {
     fn from_block(block: bytes::Bytes) -> StorageResult<Self> {
-        BlockIter::new(block)
+        NormalBlockIter::new(block)
     }
 }
 
@@ -161,9 +177,20 @@ impl DataBlockIter for BlockIter {
 mod tests {
     use bytes::Bytes;
 
-    use crate::{iterators::iter::StorageIter, row_key::BinaryKey};
+    use crate::{
+        iterators::{entry_decode_iter::EntryDecodeIter, iter::{AsArray, StorageIter}},
+        row_key::BinaryKey,
+    };
 
-    use super::BlockIter;
+    use super::{NormalBlockIter, RawEntry};
+
+    fn key(bytes: &'static [u8]) -> BinaryKey<'static> {
+        BinaryKey::from(bytes)
+    }
+
+    fn raw_entry_bytes<'a>(entry: RawEntry<'a>) -> &'a [u8] {
+        entry.as_array()
+    }
 
     // Build a raw block from a list of (key, value) pairs.
     // Layout: count(u32) | key_offsets+sentinel([u32]) | value_offsets+sentinel([u32]) | keys | values
@@ -210,9 +237,9 @@ mod tests {
         Bytes::from(buf)
     }
 
-    fn make_iter() -> BlockIter {
+    fn make_iter() -> NormalBlockIter {
         let block = build_block(&[(b"apple", b"v1"), (b"banana", b"v2"), (b"cherry", b"v3")]);
-        let mut iter = BlockIter::new(block).unwrap();
+        let mut iter = NormalBlockIter::new(block).unwrap();
         iter.seek_to_first().unwrap();
         iter
     }
@@ -221,21 +248,21 @@ mod tests {
     fn test_seek_to_first() {
         let iter = make_iter();
         assert!(iter.valid());
-        assert_eq!(iter.key().unwrap(), BinaryKey::from_slice(b"apple"));
-        assert_eq!(iter.value().unwrap(), b"v1");
+        assert_eq!(iter.key().unwrap(), key(b"apple"));
+        assert_eq!(raw_entry_bytes(iter.value().unwrap()), b"v1");
     }
 
     #[test]
     fn test_next_iterates_all() {
         let mut iter = make_iter();
-        assert_eq!(iter.key().unwrap(), BinaryKey::from_slice(b"apple"));
-        assert_eq!(iter.value().unwrap(), b"v1");
+        assert_eq!(iter.key().unwrap(), key(b"apple"));
+        assert_eq!(raw_entry_bytes(iter.value().unwrap()), b"v1");
         iter.next().unwrap();
-        assert_eq!(iter.key().unwrap(), BinaryKey::from_slice(b"banana"));
-        assert_eq!(iter.value().unwrap(), b"v2");
+        assert_eq!(iter.key().unwrap(), key(b"banana"));
+        assert_eq!(raw_entry_bytes(iter.value().unwrap()), b"v2");
         iter.next().unwrap();
-        assert_eq!(iter.key().unwrap(), BinaryKey::from_slice(b"cherry"));
-        assert_eq!(iter.value().unwrap(), b"v3");
+        assert_eq!(iter.key().unwrap(), key(b"cherry"));
+        assert_eq!(raw_entry_bytes(iter.value().unwrap()), b"v3");
         iter.next().unwrap();
         assert!(!iter.valid());
     }
@@ -243,33 +270,33 @@ mod tests {
     #[test]
     fn test_seek_exact_match() {
         let mut iter = make_iter();
-        iter.seek(&BinaryKey::from_slice(b"banana")).unwrap();
+        iter.seek(&key(b"banana")).unwrap();
         assert!(iter.valid());
-        assert_eq!(iter.key().unwrap(), BinaryKey::from_slice(b"banana"));
-        assert_eq!(iter.value().unwrap(), b"v2");
+        assert_eq!(iter.key().unwrap(), key(b"banana"));
+        assert_eq!(raw_entry_bytes(iter.value().unwrap()), b"v2");
     }
 
     #[test]
     fn test_seek_between_keys() {
         // "b" sorts between "apple" and "banana"
         let mut iter = make_iter();
-        iter.seek(&BinaryKey::from_slice(b"b")).unwrap();
+        iter.seek(&key(b"b")).unwrap();
         assert!(iter.valid());
-        assert_eq!(iter.key().unwrap(), BinaryKey::from_slice(b"banana"));
+        assert_eq!(iter.key().unwrap(), key(b"banana"));
     }
 
     #[test]
     fn test_seek_before_first() {
         let mut iter = make_iter();
-        iter.seek(&BinaryKey::from_slice(b"aaa")).unwrap();
+        iter.seek(&key(b"aaa")).unwrap();
         assert!(iter.valid());
-        assert_eq!(iter.key().unwrap(), BinaryKey::from_slice(b"apple"));
+        assert_eq!(iter.key().unwrap(), key(b"apple"));
     }
 
     #[test]
     fn test_seek_after_last() {
         let mut iter = make_iter();
-        iter.seek(&BinaryKey::from_slice(b"zzz")).unwrap();
+        iter.seek(&key(b"zzz")).unwrap();
         assert!(!iter.valid());
     }
 }

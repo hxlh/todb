@@ -5,18 +5,20 @@ use crate::{
     builder::{SstFooter, SstOption},
     errors::{StorageError, StorageResult},
     iterators::{
-        block_iter::BlockIter,
+        block_iter::NormalBlockIter,
+        entry_decode_iter::EntryDecodeIter,
         index_tree_iter::IndexTreeIter,
-        iter::{DataBlockIter, IndexBlockIter, StorageIter},
+        iter::{AsArray, DataBlockIter, IndexBlockIter, StorageIter},
     },
 };
 
-pub struct SstIter<R, I = BlockIter, D = BlockIter>
+pub struct SstIter<R, I = NormalBlockIter, D = EntryDecodeIter<NormalBlockIter>>
 where
     R: BlockReader,
     I: IndexBlockIter,
-    for<'a> BlockHandle: From<I::Value<'a>>,
+    for<'a> I::Value<'a>: AsArray<'a>,
     D: DataBlockIter,
+    for<'a> D::Value<'a>: AsArray<'a>,
 {
     reader: Arc<R>,
     #[allow(dead_code)]
@@ -29,8 +31,9 @@ impl<R, I, D> SstIter<R, I, D>
 where
     R: BlockReader,
     I: IndexBlockIter,
-    for<'a> BlockHandle: From<I::Value<'a>>,
+    for<'a> I::Value<'a>: AsArray<'a>,
     D: DataBlockIter,
+    for<'a> D::Value<'a>: AsArray<'a>,
 {
     pub fn new(reader: Arc<R>, footer: SstFooter, option: SstOption) -> StorageResult<Self> {
         Ok(Self {
@@ -46,14 +49,14 @@ impl<R, I, D> StorageIter for SstIter<R, I, D>
 where
     R: BlockReader,
     I: IndexBlockIter,
-    for<'a> BlockHandle: From<I::Value<'a>>,
+    for<'a> I::Value<'a>: AsArray<'a>,
     D: DataBlockIter,
+    for<'a> D::Value<'a>: AsArray<'a>,
     // Index and data block must share the same key type so seek targets are compatible.
     // Key<'a> has no `where Self: 'a`, so for<'a> does not require I: 'static or D: 'static.
     for<'a> I: StorageIter<Key<'a> = D::Key<'a>>,
 {
     type Key<'a> = D::Key<'a>;
-
     type Value<'a> = D::Value<'a> where Self: 'a;
 
     fn valid(&self) -> bool {
@@ -114,11 +117,11 @@ where
     fn key(&self) -> Option<Self::Key<'_>> {
         self.data_iter.as_ref()?.key()
     }
-
     fn value(&self) -> Option<Self::Value<'_>> {
         self.data_iter.as_ref()?.value()
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -129,7 +132,11 @@ mod tests {
     use crate::{
         block::{InMemoryBlockReader, InMemoryBlockWriter},
         builder::{SstBuilder, SstFooter, SstOption},
-        iterators::{block_iter::BlockIter, iter::StorageIter},
+        iterators::{
+            block_iter::NormalBlockIter,
+            entry_decode_iter::EntryDecodeIter,
+            iter::{AsArray, StorageIter},
+        },
         row_key::RowKey,
         testing::init_tracing,
     };
@@ -153,11 +160,14 @@ mod tests {
         let (footer, writer) = builder.finish().unwrap();
         (writer.into_inner(), footer, option)
     }
-
-    fn make_iter(n: u64, block_size: usize) -> SstIter<InMemoryBlockReader, BlockIter, BlockIter> {
+    fn make_iter(
+        n: u64,
+        block_size: usize,
+    ) -> SstIter<InMemoryBlockReader, NormalBlockIter, EntryDecodeIter<NormalBlockIter>> {
         let (bytes, footer, option) = build_sst(n, block_size);
         let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(bytes), block_size));
-        SstIter::<_, BlockIter, BlockIter>::new(reader, footer, option).unwrap()
+        SstIter::<_, NormalBlockIter, EntryDecodeIter<NormalBlockIter>>::new(reader, footer, option)
+            .unwrap()
     }
 
     // 空 SST seek_to_first 后 valid() 应为 false
@@ -174,8 +184,8 @@ mod tests {
         let mut iter = make_iter(200, 256);
         iter.seek_to_first().unwrap();
         assert!(iter.valid());
-        assert_eq!(iter.key().unwrap(), RowKey::from_slice(&make_key(0)));
-        assert_eq!(iter.value().unwrap(), make_value(0).as_ref());
+        assert_eq!(iter.key().unwrap(), (&make_key(0)).into());
+        assert_eq!(iter.value().unwrap().as_array(), make_value(0).as_ref());
     }
 
     // next() 按顺序遍历所有 key，数量和顺序都正确
@@ -187,8 +197,8 @@ mod tests {
         iter.seek_to_first().unwrap();
         for i in 0..n {
             assert!(iter.valid(), "expected valid at i={}", i);
-            assert_eq!(iter.key().unwrap(), RowKey::from_slice(&make_key(i)));
-            assert_eq!(iter.value().unwrap(), make_value(i).as_ref());
+            assert_eq!(iter.key().unwrap(), (&make_key(i)).into());
+            assert_eq!(iter.value().unwrap().as_array(), make_value(i).as_ref());
             iter.next().unwrap();
         }
         assert!(!iter.valid(), "expected invalid after last entry");
@@ -199,10 +209,10 @@ mod tests {
     fn test_seek_exact_match() {
         let mut iter = make_iter(200, 256);
         let k = make_key(100);
-        iter.seek(&RowKey::from_slice(&k)).unwrap();
+        iter.seek(&(&k).into()).unwrap();
         assert!(iter.valid());
-        assert_eq!(iter.key().unwrap(), RowKey::from_slice(&k));
-        assert_eq!(iter.value().unwrap(), make_value(100).as_ref());
+        assert_eq!(iter.key().unwrap(), (&k).into());
+        assert_eq!(iter.value().unwrap().as_array(), make_value(100).as_ref());
     }
 
     // seek 落在两个 key 之间，定位到后一个
@@ -212,9 +222,9 @@ mod tests {
         // 构造一个介于 key(50) 和 key(51) 之间的字节序列
         let mut between = make_key(50).to_vec();
         *between.last_mut().unwrap() += 1; // 50 + 小量偏移
-        iter.seek(&RowKey::from_slice(&between)).unwrap();
+        iter.seek(&(&between).into()).unwrap();
         assert!(iter.valid());
-        assert_eq!(iter.key().unwrap(), RowKey::from_slice(&make_key(51)));
+        assert_eq!(iter.key().unwrap(), (&make_key(51)).into());
     }
 
     // seek 小于所有 key，定位到第一个
@@ -222,9 +232,9 @@ mod tests {
     fn test_seek_before_first_key() {
         let mut iter = make_iter(200, 256);
         let before = vec![0u8; 7]; // 小于 key(0) = [0,0,0,0,0,0,0,0]
-        iter.seek(&RowKey::from_slice(&before)).unwrap();
+        iter.seek(&(&before).into()).unwrap();
         assert!(iter.valid());
-        assert_eq!(iter.key().unwrap(), RowKey::from_slice(&make_key(0)));
+        assert_eq!(iter.key().unwrap(), (&make_key(0)).into());
     }
 
     // seek 超过最后一个 key， valid() 应为 false
@@ -232,7 +242,7 @@ mod tests {
     fn test_seek_after_last_key() {
         let mut iter = make_iter(200, 256);
         let beyond = make_key(u64::MAX);
-        iter.seek(&RowKey::from_slice(&beyond)).unwrap();
+        iter.seek(&(&beyond).into()).unwrap();
         assert!(!iter.valid());
     }
 }

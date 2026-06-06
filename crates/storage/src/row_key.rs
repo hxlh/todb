@@ -6,12 +6,17 @@ pub struct BinaryKey<'a> {
 }
 
 impl<'a> BinaryKey<'a> {
-    pub fn from_slice<T: AsRef<[u8]> + ?Sized>(b: &'a T) -> Self {
-        Self { buf: b.as_ref() }
-    }
-
     pub fn as_bytes(&self) -> &[u8] {
         self.buf
+    }
+}
+
+impl<'a, T> From<&'a T> for BinaryKey<'a>
+where
+    T: AsRef<[u8]> + ?Sized,
+{
+    fn from(buf: &'a T) -> Self {
+        Self { buf: buf.as_ref() }
     }
 }
 

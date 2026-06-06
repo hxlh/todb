@@ -2,6 +2,21 @@ use bytes::{Bytes, BytesMut};
 
 use crate::builder::SstOption;
 
+// Fixed header for an empty block:
+// - entry_count: u32
+// - key_offsets sentinel: u32
+// - value_offsets sentinel: u32
+// Per-entry offset slots are accounted for in `estimated_size`; this constant
+// covers only the invariant 12-byte prefix so `would_exceed()` matches the
+// serialized block length.
+const BLOCK_FIXED_HEADER_SIZE: usize = 12;
+
+const DATA_ENTRY_VERSION: u8 = 1;
+// Data entries are serialized as `[format_version][entry_kind][payload]`.
+const DATA_ENTRY_HEADER_LEN: usize = 2;
+// Each entry contributes one key offset and one value offset (u32 + u32).
+const PER_ENTRY_OFFSET_TABLE_BYTES: usize = 8;
+
 /// Builds a data block from sorted (key, value) entries.
 pub struct DataBlockBuilder {
     option: SstOption,
@@ -19,9 +34,16 @@ impl DataBlockBuilder {
     }
 
     pub fn add(&mut self, key: Bytes, value: Bytes) {
-        assert!(key.len() + value.len() + 8 < self.option.block_size);
-        // Overhead: 8 bytes per entry for key offset + value offset
-        self.estimated_size += key.len() + value.len() + 8;
+        let entry_size = key.len() + value.len() + PER_ENTRY_OFFSET_TABLE_BYTES + DATA_ENTRY_HEADER_LEN;
+        assert!(BLOCK_FIXED_HEADER_SIZE + entry_size < self.option.block_size);
+        // `estimated_size` tracks only per-entry bytes:
+        // - key payload
+        // - value payload
+        // - one key offset + one value offset (8 bytes total)
+        // - the 2-byte entry envelope header
+        // The invariant 12-byte block prefix is accounted for separately by
+        // `BLOCK_FIXED_HEADER_SIZE` in `would_exceed()` and the assertion above.
+        self.estimated_size += entry_size;
         self.entries.push((key, value));
     }
 
@@ -30,7 +52,9 @@ impl DataBlockBuilder {
     }
 
     pub fn would_exceed(&self, key: &Bytes, value: &Bytes) -> bool {
-        self.estimated_size + key.len() + value.len() + 8 > self.option.block_size
+        let next_entry_size =
+            key.len() + value.len() + PER_ENTRY_OFFSET_TABLE_BYTES + DATA_ENTRY_HEADER_LEN;
+        BLOCK_FIXED_HEADER_SIZE + self.estimated_size + next_entry_size > self.option.block_size
     }
 
     pub fn is_empty(&self) -> bool {
@@ -50,10 +74,9 @@ impl DataBlockBuilder {
     /// Layout:
     /// ```text
     /// [entry_count: u32 BE]
-    /// [key_offset_0: u32 BE] [key_offset_1: u32 BE] ...
-    /// [val_offset_0: u32 BE] [val_offset_1: u32 BE] ...
-    /// [key_0 bytes] [key_1 bytes] ...
-    /// [val_0 bytes] [val_1 bytes] ...
+    /// [key_offset_0: u32 BE] ... [key_offset_{n-1}: u32 BE] [key_end_sentinel: u32 BE]
+    /// [val_offset_0: u32 BE] ... [val_offset_{n-1}: u32 BE] [val_end_sentinel: u32 BE]
+    /// [[format_version: u8] [entry_kind: u8] [payload bytes]] ...
     /// ```
     pub fn finish(&mut self) -> Bytes {
         let count = self.entries.len() as u32;
@@ -78,7 +101,7 @@ impl DataBlockBuilder {
 
         for (_key, value) in &self.entries {
             val_offsets.push(data_offset as u32);
-            data_offset += value.len();
+            data_offset += DATA_ENTRY_HEADER_LEN + value.len();
         }
         val_offsets.push(data_offset as u32); // value sentinel = end of block
 
@@ -95,8 +118,9 @@ impl DataBlockBuilder {
             buf.extend_from_slice(key);
         }
 
-        // Write value bytes
+        // Write entry-encoded value bytes: [version][kind=Put][payload]
         for (_key, value) in &self.entries {
+            buf.extend_from_slice(&[DATA_ENTRY_VERSION, 0]);
             buf.extend_from_slice(value);
         }
 
@@ -128,7 +152,7 @@ mod tests {
         assert_eq!(&buf[..4], &0u32.to_be_bytes());
     }
 
-    // Single entry: verify every field position in the encoded bytes.
+    // Single entry: verify versioned entry payload layout.
     #[test]
     fn test_single_entry_layout() {
         let mut b = DataBlockBuilder::new(&option());
@@ -138,14 +162,14 @@ mod tests {
         // count = 1
         assert_eq!(u32::from_be_bytes(buf[0..4].try_into().unwrap()), 1);
         // header_size = 4 + (1+1)*8 = 20
-        // key_offset[0]=20, key_sentinel=21, val_offset[0]=21, val_sentinel=22
-        assert_eq!(u32::from_be_bytes(buf[4..8].try_into().unwrap()), 20); // key_offset[0]
-        assert_eq!(u32::from_be_bytes(buf[8..12].try_into().unwrap()), 21); // key sentinel
-        assert_eq!(u32::from_be_bytes(buf[12..16].try_into().unwrap()), 21); // val_offset[0]
-        assert_eq!(u32::from_be_bytes(buf[16..20].try_into().unwrap()), 22); // val sentinel
+        // key_offset[0]=20, key_sentinel=21, val_offset[0]=21, val_sentinel=24
+        assert_eq!(u32::from_be_bytes(buf[4..8].try_into().unwrap()), 20);
+        assert_eq!(u32::from_be_bytes(buf[8..12].try_into().unwrap()), 21);
+        assert_eq!(u32::from_be_bytes(buf[12..16].try_into().unwrap()), 21);
+        assert_eq!(u32::from_be_bytes(buf[16..20].try_into().unwrap()), 24);
         assert_eq!(&buf[20..21], b"k");
-        assert_eq!(&buf[21..22], b"v");
-        assert_eq!(buf.len(), 22);
+        assert_eq!(&buf[21..24], &[1, 0, b'v']);
+        assert_eq!(buf.len(), 24);
     }
 
     // Two entries: offsets must be contiguous and non-overlapping.
@@ -166,17 +190,24 @@ mod tests {
         let val1 = u32::from_be_bytes(buf[20..24].try_into().unwrap()) as usize;
         let val_sent = u32::from_be_bytes(buf[24..28].try_into().unwrap()) as usize;
 
-        assert_eq!(key0, 28); // header ends at 28
-        assert_eq!(key1, 30); // "ab" = 2 bytes
-        assert_eq!(key_sent, 31); // "c"  = 1 byte
-        assert_eq!(val0, 31); // values start where keys end
-        assert_eq!(val1, 33); // "xy" = 2 bytes
-        assert_eq!(val_sent, 34); // "z"  = 1 byte
+        assert_eq!(key0, 28);
+        assert_eq!(key1, 30);
+        assert_eq!(key_sent, 31);
+        assert_eq!(val0, 31);
+        assert_eq!(val1, 35); // first value = 2-byte header + 2-byte payload
+        assert_eq!(val_sent, 38); // second value = 2-byte header + 1-byte payload
 
         assert_eq!(&buf[key0..key1], b"ab");
         assert_eq!(&buf[key1..key_sent], b"c");
-        assert_eq!(&buf[val0..val1], b"xy");
-        assert_eq!(&buf[val1..val_sent], b"z");
+        assert_eq!(&buf[val0..val1], &[1, 0, b'x', b'y']);
+        assert_eq!(&buf[val1..val_sent], &[1, 0, b'z']);
+    }
+
+    #[test]
+    fn test_would_exceed_accounts_for_fixed_header() {
+        let option = SstOption::default().block_size(23);
+        let b = DataBlockBuilder::new(&option);
+        assert!(b.would_exceed(&Bytes::from("k"), &Bytes::from("v")));
     }
 
     // finish() resets the builder so it can be reused.

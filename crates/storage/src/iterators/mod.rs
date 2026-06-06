@@ -6,4 +6,7 @@ pub mod map_iter;
 pub mod merge_iter;
 pub mod sst_iter;
 pub mod two_merge_iter;
+pub use entry_decode_iter::EntryValue;
 pub use two_merge_iter::TwoMergeIter;
+pub(crate) mod entry_decode_iter;
+pub(crate) mod index_entry_decode_iter;

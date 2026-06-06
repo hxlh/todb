@@ -12,7 +12,7 @@ use ouroboros::self_referencing;
 
 use crate::{
     errors::StorageResult,
-    iterators::{iter::StorageIter, map_iter::MappedStorageIter},
+    iterators::{entry_decode_iter::EntryValue, iter::StorageIter, map_iter::MappedStorageIter},
     row_key::RowKey,
 };
 
@@ -264,16 +264,18 @@ impl OwnedMemTableIter<Bytes, Bytes> {
 
 impl MappedStorageIter for OwnedMemTableIter<Bytes, Bytes> {
     type MappedKey<'a> = RowKey<'a>;
-    type MappedValue<'a> = &'a [u8];
+    type MappedValue<'a> = EntryValue<'a>;
 
     fn map_key<'a>(key: Self::Key<'a>) -> RowKey<'a> {
-        RowKey::from_slice(key)
+        (key).into()
     }
 
-    fn map_value<'a>(value: Self::Value<'a>) -> &'a [u8] {
+    fn map_value<'a>(
+        value: Self::Value<'a>,
+    ) -> EntryValue<'a> {
         match value {
-            Entry::Put(v) => v.as_ref(),
-            Entry::Delete => b"",
+            Entry::Put(v) => EntryValue::Put(v.as_ref()),
+            Entry::Delete => EntryValue::Delete,
         }
     }
 

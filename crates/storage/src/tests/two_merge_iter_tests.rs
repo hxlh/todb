@@ -2,6 +2,7 @@ use bytes::Bytes;
 
 use crate::{
     iterators::{
+        entry_decode_iter::EntryValue,
         iter::StorageIter,
         map_iter::MapIter,
         merge_iter::MergeIter,
@@ -12,8 +13,8 @@ use crate::{
     tests::helpers::{make_key, make_sst_iter},
 };
 
-/// Memtable side: OwnedMemTableIter<Bytes, Bytes> implements MappedStorageIter
-/// mapping its native (&Bytes, &Entry<Bytes>) to (RowKey<'a>, &[u8]).
+/// Memtable side maps native entries to (RowKey<'a>, EntryValue<'a>) so it matches
+/// SST iteration directly; only memtable needs MapIter.
 type MemIter = MapIter<OwnedMemTableIter<Bytes, Bytes>>;
 
 fn mem_iter(mem: &MemTable<Bytes, Bytes>) -> MemIter {
@@ -31,23 +32,25 @@ fn test_memtable_wins_on_overlap() {
     let mem_merge = MergeIter::new(vec![mem_iter(&mem)]);
     let sst_merge = MergeIter::new(vec![sst]);
     let mut iter = TwoMergeIter::new(mem_merge, sst_merge).unwrap();
-
     let mut keys = vec![];
-    let mut values = vec![];
+    let mut values: Vec<Option<Vec<u8>>> = vec![];
     while iter.valid() {
         let k = iter.key().unwrap();
-        let v = iter.value().unwrap();
+        let v = match iter.value().unwrap() {
+            EntryValue::Put(buf) => Some(buf.to_vec()),
+            EntryValue::Delete => None,
+        };
         keys.push(u64::from_be_bytes(k.as_bytes().try_into().unwrap()));
-        values.push(v.to_vec());
+        values.push(v);
         iter.next().unwrap();
     }
 
     assert_eq!(keys, vec![0, 1, 2, 3, 4, 5, 6, 7]);
     for i in 0..5 {
-        assert_eq!(&values[i], format!("mem_{:04}", i).as_bytes());
+        assert_eq!(values[i].as_deref(), Some(format!("mem_{:04}", i).as_bytes()));
     }
     for i in 5..8usize {
-        assert_eq!(&values[i], format!("value_{:04}", i).as_bytes());
+        assert_eq!(values[i].as_deref(), Some(format!("value_{:04}", i).as_bytes()));
     }
 }
 
@@ -91,12 +94,12 @@ fn test_seek_across_merge() {
     let mut iter = TwoMergeIter::new(mem_merge, sst_merge).unwrap();
 
     let target_bytes = 5u64.to_be_bytes();
-    let target = RowKey::from_slice(&target_bytes);
+    let target = (&target_bytes).into();
     iter.seek(&target).unwrap();
 
     let k = iter.key().unwrap();
     assert_eq!(u64::from_be_bytes(k.as_bytes().try_into().unwrap()), 5);
-    assert_eq!(iter.value().unwrap(), b"mem_0005");
+    assert_eq!(iter.value().unwrap(), EntryValue::Put(b"mem_0005"));
 }
 
 #[test]
@@ -109,15 +112,18 @@ fn test_tombstone_shadows_sst() {
     let sst_merge = MergeIter::new(vec![sst]);
     let mut iter = TwoMergeIter::new(mem_merge, sst_merge).unwrap();
 
-    let mut found = vec![];
+    let mut found: Vec<(u64, Option<Vec<u8>>)> = vec![];
     while iter.valid() {
         let k = u64::from_be_bytes(iter.key().unwrap().as_bytes().try_into().unwrap());
-        let v = iter.value().unwrap().to_vec();
+        let v = match iter.value().unwrap() {
+            EntryValue::Put(buf) => Some(buf.to_vec()),
+            EntryValue::Delete => None,
+        };
         found.push((k, v));
         iter.next().unwrap();
     }
 
     let entry3 = found.iter().find(|(k, _)| *k == 3).unwrap();
-    assert_eq!(entry3.1, b"");
+    assert_eq!(entry3.1, None);
     assert_eq!(found.len(), 5);
 }

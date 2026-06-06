@@ -2,6 +2,10 @@ use bytes::Bytes;
 
 use crate::errors::StorageResult;
 
+pub trait AsArray<'a> {
+    fn as_array(&self) -> &'a [u8];
+}
+
 pub trait StorageIter {
     type Key<'a>: Ord;
     type Value<'a>

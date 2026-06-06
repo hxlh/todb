@@ -21,7 +21,7 @@ fn test_single_sst_seek_to_first() {
     iter.seek_to_first().unwrap();
     for i in 0..5u64 {
         assert!(iter.valid(), "expected valid at i={}", i);
-        assert_eq!(iter.key().unwrap(), RowKey::from_slice(&make_key(i)));
+        assert_eq!(iter.key().unwrap(), (&make_key(i)).into());
         iter.next().unwrap();
     }
     assert!(!iter.valid());
@@ -38,7 +38,7 @@ fn test_multi_sst_seek_to_first_crosses_boundary() {
     iter.seek_to_first().unwrap();
     for i in 0..9u64 {
         assert!(iter.valid(), "expected valid at i={}", i);
-        assert_eq!(iter.key().unwrap(), RowKey::from_slice(&make_key(i)));
+        assert_eq!(iter.key().unwrap(), (&make_key(i)).into());
         iter.next().unwrap();
     }
     assert!(!iter.valid());
@@ -62,25 +62,25 @@ fn test_next_crosses_sst_boundary() {
 #[test]
 fn test_seek_exact_match_in_second_sst() {
     let mut iter = ConcatIter::new(vec![make_sst_iter(0, 5), make_sst_iter(5, 10)]);
-    iter.seek(&RowKey::from_slice(&make_key(7))).unwrap();
+    iter.seek(&(&make_key(7)).into()).unwrap();
     assert!(iter.valid());
-    assert_eq!(iter.key().unwrap(), RowKey::from_slice(&make_key(7)));
+    assert_eq!(iter.key().unwrap(), (&make_key(7)).into());
 }
 
 // seek to a key in a gap between SSTs lands on the first key of the next SST.
 #[test]
 fn test_seek_between_ssts_lands_on_next_sst_first_key() {
     let mut iter = ConcatIter::new(vec![make_sst_iter(0, 3), make_sst_iter(10, 13)]);
-    iter.seek(&RowKey::from_slice(&make_key(5))).unwrap();
+    iter.seek(&(&make_key(5)).into()).unwrap();
     assert!(iter.valid());
-    assert_eq!(iter.key().unwrap(), RowKey::from_slice(&make_key(10)));
+    assert_eq!(iter.key().unwrap(), (&make_key(10)).into());
 }
 
 // seek past the last key in all SSTs results in invalid.
 #[test]
 fn test_seek_past_all_keys_is_invalid() {
     let mut iter = ConcatIter::new(vec![make_sst_iter(0, 5), make_sst_iter(5, 10)]);
-    iter.seek(&RowKey::from_slice(&make_key(u64::MAX))).unwrap();
+    iter.seek(&(&make_key(u64::MAX)).into()).unwrap();
     assert!(!iter.valid());
 }
 

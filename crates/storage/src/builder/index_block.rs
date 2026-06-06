@@ -2,6 +2,18 @@ use bytes::{Bytes, BytesMut};
 
 use crate::{block::BlockHandle, builder::SstOption};
 
+const INDEX_VALUE_VERSION: u8 = 1;
+const INDEX_VALUE_LEN: usize = 1 + size_of::<u64>();
+
+// Fixed header for an empty block:
+// - entry_count: u32
+// - key_offsets sentinel: u32
+// - value_offsets sentinel: u32
+// Per-entry offset slots are accounted for in `estimated_size`; this constant
+// covers only the invariant 12-byte prefix so `would_exceed()` matches the
+// serialized block length.
+const BLOCK_FIXED_HEADER_SIZE: usize = 12;
+
 /// One entry in an index block: end_key -> child block location.
 #[derive(Debug, Clone)]
 pub struct IndexEntry {
@@ -26,9 +38,8 @@ impl IndexBlockBuilder {
     }
 
     pub fn add(&mut self, end_key: Bytes, child: BlockHandle) {
-        // Overhead: 4 bytes key offset + 4 bytes val offset + 8 bytes child offset
-        assert!(end_key.len() + 16 < self.option.block_size);
-        self.estimated_size += end_key.len() + 16;
+        assert!(BLOCK_FIXED_HEADER_SIZE + end_key.len() + 17 < self.option.block_size);
+        self.estimated_size += end_key.len() + 17;
         self.entries.push(IndexEntry { end_key, child });
     }
 
@@ -37,7 +48,7 @@ impl IndexBlockBuilder {
     }
 
     pub fn would_exceed(&self, end_key: &Bytes, _child: &BlockHandle) -> bool {
-        self.estimated_size + end_key.len() + 16 > self.option.block_size
+        BLOCK_FIXED_HEADER_SIZE + self.estimated_size + end_key.len() + 17 > self.option.block_size
     }
 
     pub fn is_empty(&self) -> bool {
@@ -57,10 +68,10 @@ impl IndexBlockBuilder {
     /// Layout mirrors DataBlock so BlockIter can parse it directly:
     /// ```text
     /// [entry_count: u32 BE]
-    /// [key_offset_0: u32 BE] [key_offset_1: u32 BE] ...
-    /// [val_offset_0: u32 BE] [val_offset_1: u32 BE] ...
-    /// [end_key_0 bytes] [end_key_1 bytes] ...
-    /// [child_offset_0: u64 BE] [child_offset_1: u64 BE] ...
+    /// [key_offset_0: u32 BE] ... [key_offset_{n-1}: u32 BE] [key_end_sentinel: u32 BE]
+    /// [val_offset_0: u32 BE] ... [val_offset_{n-1}: u32 BE] [val_end_sentinel: u32 BE]
+    /// [end_key_0 bytes] [end_key_1 bytes] ... [end_key_{n-1} bytes]
+    /// [[format_version: u8] [child_offset: u64 BE]] ...
     /// ```
     pub fn finish(&mut self) -> Bytes {
         let count = self.entries.len() as u32;
@@ -82,10 +93,10 @@ impl IndexBlockBuilder {
         }
         key_offsets.push(data_offset as u32); // key sentinel = start of value area
 
-        // Each value is a fixed 8-byte u64 child offset
+        // Each value is a fixed 1-byte version + 8-byte u64 child offset
         for _ in &self.entries {
             val_offsets.push(data_offset as u32);
-            data_offset += 8;
+            data_offset += INDEX_VALUE_LEN;
         }
         val_offsets.push(data_offset as u32); // value sentinel = end of block
 
@@ -99,6 +110,7 @@ impl IndexBlockBuilder {
             buf.extend_from_slice(&entry.end_key);
         }
         for entry in &self.entries {
+            buf.extend_from_slice(&[INDEX_VALUE_VERSION]);
             buf.extend_from_slice(&entry.child.offset.to_be_bytes());
         }
 
@@ -140,14 +152,15 @@ mod tests {
         // count = 1
         assert_eq!(u32::from_be_bytes(buf[0..4].try_into().unwrap()), 1);
         // header_size = 4 + (1+1)*8 = 20
-        // key_offset[0]=20, key_sentinel=21, val_offset[0]=21, val_sentinel=29
+        // key_offset[0]=20, key_sentinel=21, val_offset[0]=21, val_sentinel=30
         assert_eq!(u32::from_be_bytes(buf[4..8].try_into().unwrap()), 20); // key_offset[0]
         assert_eq!(u32::from_be_bytes(buf[8..12].try_into().unwrap()), 21); // key sentinel
         assert_eq!(u32::from_be_bytes(buf[12..16].try_into().unwrap()), 21); // val_offset[0]
-        assert_eq!(u32::from_be_bytes(buf[16..20].try_into().unwrap()), 29); // val sentinel
+        assert_eq!(u32::from_be_bytes(buf[16..20].try_into().unwrap()), 30); // val sentinel
         assert_eq!(&buf[20..21], b"k");
-        assert_eq!(u64::from_be_bytes(buf[21..29].try_into().unwrap()), 0xAB);
-        assert_eq!(buf.len(), 29);
+        assert_eq!(buf[21], 1);
+        assert_eq!(u64::from_be_bytes(buf[22..30].try_into().unwrap()), 0xAB);
+        assert_eq!(buf.len(), 30);
     }
 
     // Two entries: offsets, keys, and child handles must be correctly positioned.
@@ -172,19 +185,36 @@ mod tests {
         assert_eq!(key1, 30); // "ab" = 2 bytes
         assert_eq!(key_sent, 31); // "c"  = 1 byte
         assert_eq!(val0, 31); // values start where keys end
-        assert_eq!(val1, 39); // first value is 8 bytes
-        assert_eq!(val_sent, 47); // second value is 8 bytes
+        assert_eq!(val1, 40); // first value is 9 bytes
+        assert_eq!(val_sent, 49); // second value is 9 bytes
 
         assert_eq!(&buf[key0..key1], b"ab");
         assert_eq!(&buf[key1..key_sent], b"c");
+        assert_eq!(buf[val0], 1);
         assert_eq!(
-            u64::from_be_bytes(buf[val0..val1].try_into().unwrap()),
+            u64::from_be_bytes(buf[val0 + 1..val1].try_into().unwrap()),
             0x10
         );
+        assert_eq!(buf[val1], 1);
         assert_eq!(
-            u64::from_be_bytes(buf[val1..val_sent].try_into().unwrap()),
+            u64::from_be_bytes(buf[val1 + 1..val_sent].try_into().unwrap()),
             0x20
         );
+    }
+
+    #[test]
+    fn test_size_estimation_accounts_for_versioned_index_value() {
+        let mut b = IndexBlockBuilder::new(&option());
+        b.add(Bytes::from("ab"), BlockHandle { offset: 1 });
+        assert_eq!(b.estimated_size(), 19);
+        assert!(!b.would_exceed(&Bytes::from("c"), &BlockHandle { offset: 2 }));
+    }
+
+    #[test]
+    fn test_would_exceed_accounts_for_fixed_header() {
+        let option = SstOption::default().block_size(29);
+        let b = IndexBlockBuilder::new(&option);
+        assert!(b.would_exceed(&Bytes::from("k"), &BlockHandle { offset: 1 }));
     }
 
     // finish() resets the builder so it can be reused.

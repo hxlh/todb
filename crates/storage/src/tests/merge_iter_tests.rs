@@ -52,16 +52,16 @@ fn test_overlapping_ssts_lower_level_comes_first() {
 #[test]
 fn test_seek_across_ssts() {
     let mut iter = MergeIter::new(vec![make_sst_iter(0, 5), make_sst_iter(5, 10)]);
-    iter.seek(&RowKey::from_slice(&make_key(7))).unwrap();
+    iter.seek(&(&make_key(7)).into()).unwrap();
     assert!(iter.valid());
-    assert_eq!(iter.key().unwrap(), RowKey::from_slice(&make_key(7)));
+    assert_eq!(iter.key().unwrap(), (&make_key(7)).into());
 }
 
 // seek past all keys results in invalid.
 #[test]
 fn test_seek_past_all_keys_is_invalid() {
     let mut iter = MergeIter::new(vec![make_sst_iter(0, 5)]);
-    iter.seek(&RowKey::from_slice(&make_key(u64::MAX))).unwrap();
+    iter.seek(&(&make_key(u64::MAX)).into()).unwrap();
     assert!(!iter.valid());
 }
 
