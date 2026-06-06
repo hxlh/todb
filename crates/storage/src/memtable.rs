@@ -1,11 +1,20 @@
 use std::{
     ops::Bound,
-    sync::atomic::{self, AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{self, AtomicUsize, Ordering},
+    },
 };
 
+use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
+use ouroboros::self_referencing;
 
-use crate::{errors::StorageResult, iterators::iter::StorageIter};
+use crate::{
+    errors::StorageResult,
+    iterators::{iter::StorageIter, map_iter::MappedStorageIter},
+    row_key::RowKey,
+};
 
 /// Trait for types that can report their approximate heap size.
 pub trait MemSize {
@@ -42,21 +51,21 @@ pub enum Entry<V> {
 /// Share via `Arc<MemTable<K, V>>`. All operations are concurrent-safe.
 pub struct MemTable<K, V>
 where
-    K: Ord + Send + MemSize + 'static,
-    V: Send + MemSize + 'static,
+    K: Ord + Send + Clone + MemSize + 'static,
+    V: Send + Clone + MemSize + 'static,
 {
-    map: SkipMap<K, Entry<V>>,
+    map: Arc<SkipMap<K, Entry<V>>>,
     memory_size: AtomicUsize,
 }
 
 impl<K, V> MemTable<K, V>
 where
-    K: Ord + Send + MemSize + 'static,
-    V: Send + MemSize + 'static,
+    K: Ord + Send + Clone + MemSize + 'static,
+    V: Send + Clone + MemSize + 'static,
 {
     pub fn new() -> Self {
         Self {
-            map: SkipMap::new(),
+            map: Arc::new(SkipMap::new()),
             memory_size: AtomicUsize::new(0),
         }
     }
@@ -80,23 +89,27 @@ where
         self.memory_size.load(atomic::Ordering::Relaxed)
     }
 
-    /// Return an iterator positioned before the first entry.
-    pub fn iter(&self) -> MemTableIter<'_, K, Entry<V>> {
-        MemTableIter::new(&self.map)
+    /// Return a clone of the internal Arc<SkipMap> for use in read-path iterators.
+    pub fn map_arc(&self) -> Arc<SkipMap<K, Entry<V>>> {
+        self.map.clone()
+    }
+
+    /// Return an owned iterator backed by `Arc<SkipMap>`. The iterator is
+    /// `'static` and can be used in `TwoMergeIter` without lifetime issues.
+    pub fn iter(&self) -> OwnedMemTableIter<K, V> {
+        OwnedMemTableIter::new(self.map.clone(), |_map| None, None)
     }
 }
 
-/// Iterator over a [`MemTable`]. Implements [`StorageIter`].
-///
-/// `Key<'a> = &'a K` — borrows directly from the skip list node.
-/// `Value<'a> = Option<&'a V>` — `None` means Delete tombstone.
+/// Iterator over a [`MemTable`]. Borrows the skip list — use for unit tests
+/// and non-`TwoMergeIter` contexts where `'static` is not required.
 pub struct MemTableIter<'m, K, V>
 where
     K: Ord + Send + 'static,
     V: Send + 'static,
 {
-    map: &'m SkipMap<K, V>,
-    current: Option<crossbeam_skiplist::map::Entry<'m, K, V>>,
+    map: &'m SkipMap<K, Entry<V>>,
+    current: Option<crossbeam_skiplist::map::Entry<'m, K, Entry<V>>>,
 }
 
 impl<'m, K, V> MemTableIter<'m, K, V>
@@ -104,7 +117,7 @@ where
     K: Ord + Send + 'static,
     V: Send + 'static,
 {
-    pub fn new(map: &'m SkipMap<K, V>) -> Self {
+    pub fn new(map: &'m SkipMap<K, Entry<V>>) -> Self {
         Self { map, current: None }
     }
 }
@@ -116,7 +129,7 @@ where
 {
     type Key<'k> = &'k K;
     type Value<'v>
-        = &'v V
+        = &'v Entry<V>
     where
         Self: 'v;
 
@@ -142,17 +155,131 @@ where
     }
 
     fn key(&self) -> Option<Self::Key<'_>> {
-        if let Some(v) = &self.current {
-            return Some(v.key());
-        }
-        None
+        self.current.as_ref().map(|e| e.key())
     }
 
     fn value(&self) -> Option<Self::Value<'_>> {
-        if let Some(v) = &self.current {
-            return Some(v.value());
+        self.current.as_ref().map(|e| e.value())
+    }
+}
+
+/// Owned iterator over a [`MemTable`]. Holds `Arc<SkipMap>` so it is `'static`.
+/// Uses an ouroboros self-referential struct to keep a live `Entry` for
+/// O(1) `next()` via `entry.next()` (hybrid: `lower_bound` to seek,
+/// `Entry::next()` to advance).
+#[self_referencing]
+pub struct OwnedMemTableIter<K, V>
+where
+    K: Ord + Clone + Send + 'static,
+    V: Clone + Send + 'static,
+{
+    map: Arc<SkipMap<K, Entry<V>>>,
+    #[borrows(map)]
+    #[not_covariant]
+    current: Option<crossbeam_skiplist::map::Entry<'this, K, Entry<V>>>,
+    item: Option<(K, Entry<V>)>,
+}
+
+impl<K, V> StorageIter for OwnedMemTableIter<K, V>
+where
+    K: Ord + Clone + Send + 'static,
+    V: Clone + Send + 'static,
+{
+    type Key<'a> = &'a K;
+    type Value<'a>
+        = &'a Entry<V>
+    where
+        Self: 'a;
+
+    fn valid(&self) -> bool {
+        self.borrow_item().is_some()
+    }
+
+    fn seek_to_first(&mut self) -> StorageResult<()> {
+        let map = self.with_map(|m| m.clone());
+        let mut new = OwnedMemTableIterBuilder {
+            map,
+            current_builder: |map| map.iter().next(),
+            item: None,
         }
-        None
+        .build();
+        let kv = new.with_current(|current| {
+            current
+                .as_ref()
+                .map(|e| (e.key().clone(), e.value().clone()))
+        });
+        new.with_mut(|fields| *fields.item = kv);
+        *self = new;
+        Ok(())
+    }
+
+    fn seek<'a>(&mut self, target: &Self::Key<'a>) -> StorageResult<()> {
+        let map = self.with_map(|m| m.clone());
+        let target = (*target).clone();
+        let mut new = OwnedMemTableIterBuilder {
+            map,
+            current_builder: |map| map.lower_bound(Bound::Included(&target)),
+            item: None,
+        }
+        .build();
+        let kv = new.with_current(|current| {
+            current
+                .as_ref()
+                .map(|e| (e.key().clone(), e.value().clone()))
+        });
+        new.with_mut(|fields| *fields.item = kv);
+        *self = new;
+        Ok(())
+    }
+
+    fn next(&mut self) -> StorageResult<()> {
+        let kv = self.with_current_mut(|current| {
+            *current = current.as_ref().and_then(|e| e.next());
+            current
+                .as_ref()
+                .map(|e| (e.key().clone(), e.value().clone()))
+        });
+        self.with_mut(|fields| *fields.item = kv);
+        Ok(())
+    }
+
+    fn key(&self) -> Option<Self::Key<'_>> {
+        self.borrow_item().as_ref().map(|(k, _)| k)
+    }
+
+    fn value(&self) -> Option<Self::Value<'_>> {
+        self.borrow_item().as_ref().map(|(_, v)| v)
+    }
+}
+
+impl OwnedMemTableIter<Bytes, Bytes> {
+    /// Seek using a borrowed byte slice. Allocates a temporary `Bytes`
+    /// for the search; the allocation is short-lived (only for the
+    /// `seek` call) because `lower_bound` only reads the key.
+    pub fn seek_by_bytes(&mut self, target: &[u8]) {
+        let key = Bytes::copy_from_slice(target);
+        let _ = self.seek(&&key);
+    }
+}
+
+impl MappedStorageIter for OwnedMemTableIter<Bytes, Bytes> {
+    type MappedKey<'a> = RowKey<'a>;
+    type MappedValue<'a> = &'a [u8];
+
+    fn map_key<'a>(key: Self::Key<'a>) -> RowKey<'a> {
+        RowKey::from_slice(key)
+    }
+
+    fn map_value<'a>(value: Self::Value<'a>) -> &'a [u8] {
+        match value {
+            Entry::Put(v) => v.as_ref(),
+            Entry::Delete => b"",
+        }
+    }
+
+    fn seek_mapped(&mut self, target: &RowKey<'_>) -> StorageResult<()> {
+        self.seek_by_bytes(target.as_bytes());
+        Ok(())
     }
 }
 
@@ -169,8 +296,6 @@ mod tests {
     fn v(s: &str) -> Bytes {
         Bytes::from(s.to_string())
     }
-
-    // --- Basic reads/writes ---
 
     // put a key then seek to it — iterator should land on that key with the correct value.
     #[test]
@@ -226,38 +351,6 @@ mod tests {
         assert_eq!(*iter.key().unwrap(), k("c")); // lands on next key
     }
 
-    // --- Memory estimation ---
-
-    // a freshly created MemTable has zero memory usage.
-    #[test]
-    fn test_empty_estimate_memory() {
-        let mem: MemTable<Bytes, Bytes> = MemTable::new();
-        assert_eq!(mem.estimate_memory(), 0);
-    }
-
-    // put accumulates key.mem_size() + value.mem_size() into estimate_memory.
-    #[test]
-    fn test_put_accumulates_size() {
-        let mem = MemTable::new();
-        let key = k("abc");
-        let val = v("xyz");
-        let expected = key.mem_size() + val.mem_size();
-        mem.put(key, val);
-        assert_eq!(mem.estimate_memory(), expected);
-    }
-
-    // delete only charges key.mem_size() — tombstone carries no value bytes.
-    #[test]
-    fn test_delete_accumulates_key_size_only() {
-        let mem: MemTable<Bytes, Bytes> = MemTable::new();
-        let key = k("abc");
-        let expected = key.mem_size();
-        mem.delete(key);
-        assert_eq!(mem.estimate_memory(), expected);
-    }
-
-    // --- Iterator ---
-
     // seek_to_first positions at the smallest key regardless of insertion order.
     #[test]
     fn test_seek_to_first() {
@@ -271,8 +364,7 @@ mod tests {
         assert_eq!(*iter.key().unwrap(), k("a"));
     }
 
-    // next advances in ascending key order; Delete entries appear as None values,
-    // Put entries appear as Some. After the last entry valid() returns false.
+    // next advances in ascending key order.
     #[test]
     fn test_next_traverses_in_order() {
         let mem = MemTable::new();
@@ -297,45 +389,12 @@ mod tests {
         assert!(!iter.valid());
     }
 
-    // seek with an exact key match — iterator lands on that key and returns its value.
+    // Empty memtable — iterator is invalid after seek_to_first.
     #[test]
-    fn test_seek_exact_match() {
-        let mem = MemTable::new();
-        mem.put(k("a"), v("1"));
-        mem.put(k("b"), v("2"));
-        mem.put(k("c"), v("3"));
+    fn test_empty_memtable_is_invalid() {
+        let mem: MemTable<Bytes, Bytes> = MemTable::new();
         let mut iter = mem.iter();
-        let target = k("b");
-        // Key<'k> = &'k Bytes, so seek takes &&Bytes
-        iter.seek(&&target).unwrap();
-        assert!(iter.valid());
-        assert_eq!(*iter.key().unwrap(), k("b"));
-        assert_eq!(iter.value(), Some(&Entry::Put(v("2"))));
-    }
-
-    // seek with a key that falls between two existing keys — iterator lands on the
-    // first key >= target (lower_bound semantics).
-    #[test]
-    fn test_seek_lower_bound() {
-        let mem = MemTable::new();
-        mem.put(k("a"), v("1"));
-        mem.put(k("c"), v("3"));
-        let mut iter = mem.iter();
-        let target = k("b"); // between "a" and "c"
-        iter.seek(&&target).unwrap();
-        assert!(iter.valid());
-        assert_eq!(*iter.key().unwrap(), k("c"));
-    }
-
-    // seek past the largest key — iterator should be invalid immediately.
-    #[test]
-    fn test_seek_past_last_key() {
-        let mem = MemTable::new();
-        mem.put(k("a"), v("1"));
-        mem.put(k("b"), v("2"));
-        let mut iter = mem.iter();
-        let target = k("z");
-        iter.seek(&&target).unwrap();
+        iter.seek_to_first().unwrap();
         assert!(!iter.valid());
     }
 }

@@ -9,6 +9,12 @@ thiserror = { workspace = true }
 crossbeam-skiplist = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
+ouroboros = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "skipmap_iter"
+harness = false

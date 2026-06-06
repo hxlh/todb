@@ -19,10 +19,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # internal
 common = { path = "crates/common" }
-runtime = { path = "crates/runtime" }
 observability = { path = "crates/observability" }
-memory = { path = "crates/memory" }
-rpc = { path = "crates/rpc" }
 sql = { path = "crates/sql" }
 
 # async runtime
@@ -46,7 +43,6 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 prost = "0.13"
-prost-types = "0.13"
 tonic = "0.12"
 
 # memory
@@ -66,3 +62,5 @@ crossbeam-skiplist = "0.1.3"
 # http / sql
 pgwire = { version = "0.38.3", default-features = false, features = ["server-api-ring", "server-api-aws-lc-rs"] }
 datafusion = "44"
+
+ouroboros = "0.18.5"

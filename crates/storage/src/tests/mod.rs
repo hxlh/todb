@@ -4,3 +4,4 @@ mod helpers;
 mod sst_iter_tests;
 mod concat_iter_tests;
 mod merge_iter_tests;
+mod two_merge_iter_tests;

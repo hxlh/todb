@@ -85,6 +85,8 @@ where
             let mut d = D::from_block(block)?;
             d.seek(target)?;
             self.data_iter = Some(d);
+        } else {
+            self.data_iter = None;
         }
         Ok(())
     }
