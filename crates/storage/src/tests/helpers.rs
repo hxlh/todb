@@ -1,11 +1,10 @@
-// Shared test helpers: SST builder utilities used across iter test modules.
 use std::sync::Arc;
 
 use bytes::Bytes;
 
 use crate::{
     block::{InMemoryBlockReader, InMemoryBlockWriter},
-    builder::{SstBuilder, SstFooter, SstOption},
+    builder::{DefaultSstWriter, SstBuilder, SstFooter, SstOption},
     iterators::{iter::StorageIter, sst_iter::SstIter},
 };
 
@@ -20,12 +19,12 @@ pub fn make_value(i: u64) -> Bytes {
 /// Build an SST with keys [start, end) and return a ready-to-use SstIter.
 pub fn make_sst_iter(start: u64, end: u64) -> SstIter<InMemoryBlockReader> {
     let option = SstOption::default().block_size(256);
-    let mut builder = SstBuilder::new(InMemoryBlockWriter::new(), option.clone());
+    let mut builder = SstBuilder::new(DefaultSstWriter::new(InMemoryBlockWriter::new(), &option), option.clone());
     for i in start..end {
         builder.add(make_key(i), make_value(i)).unwrap();
     }
-    let (footer, writer) = builder.finish().unwrap();
-    let bytes = Bytes::from(writer.into_inner());
+    let (footer, sst_writer) = builder.finish().unwrap();
+    let bytes = Bytes::from(sst_writer.into_inner().into_inner());
     let reader = Arc::new(InMemoryBlockReader::new(bytes, 256));
     SstIter::new(reader, footer, option).unwrap()
 }
@@ -33,12 +32,12 @@ pub fn make_sst_iter(start: u64, end: u64) -> SstIter<InMemoryBlockReader> {
 /// Build a raw SST buffer with n keys and return (bytes, footer, option).
 pub fn build_sst(n: u64, block_size: usize) -> (Vec<u8>, SstFooter, SstOption) {
     let option = SstOption::default().block_size(block_size);
-    let mut builder = SstBuilder::new(InMemoryBlockWriter::new(), option.clone());
+    let mut builder = SstBuilder::new(DefaultSstWriter::new(InMemoryBlockWriter::new(), &option), option.clone());
     for i in 0..n {
         builder.add(make_key(i), make_value(i)).unwrap();
     }
-    let (footer, writer) = builder.finish().unwrap();
-    (writer.into_inner(), footer, option)
+    let (footer, sst_writer) = builder.finish().unwrap();
+    (sst_writer.into_inner().into_inner(), footer, option)
 }
 
 /// Collect all keys from an iterator into a Vec<u64>.

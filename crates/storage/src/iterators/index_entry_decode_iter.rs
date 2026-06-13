@@ -1,11 +1,11 @@
 use crate::{
-    block::BlockHandle,
+    block::Position,
     errors::{StorageError, StorageResult},
     iterators::iter::{AsArray, StorageIter},
 };
 
 const INDEX_VALUE_VERSION: u8 = 1;
-const BLOCK_HANDLE_LEN: usize = size_of::<u64>();
+const POSITION_LEN: usize = size_of::<u64>();
 
 pub struct IndexEntryDecodeIter<I> {
     input: I,
@@ -34,7 +34,7 @@ impl<I> IndexEntryDecodeIter<I> {
             )));
         }
 
-        if buf.len() != 1 + BLOCK_HANDLE_LEN {
+        if buf.len() != 1 + POSITION_LEN {
             return Err(StorageError::InvalidValue(format!(
                 "invalid index entry payload length: {}",
                 buf.len() - 1
@@ -124,9 +124,9 @@ impl<'a> AsArray<'a> for IndexEntryValue<'a> {
     }
 }
 
-impl From<IndexEntryValue<'_>> for BlockHandle {
+impl From<IndexEntryValue<'_>> for Position {
     fn from(value: IndexEntryValue<'_>) -> Self {
-        assert_eq!(value.buf.len(), BLOCK_HANDLE_LEN);
+        assert_eq!(value.buf.len(), POSITION_LEN);
         Self {
             offset: u64::from_be_bytes(value.buf.try_into().unwrap()),
         }
@@ -142,7 +142,7 @@ struct IndexEntryHeader {
 mod tests {
     use super::*;
     use crate::{
-        block::BlockHandle,
+        block::Position,
         iterators::{
             block_iter::RawEntry,
             iter::{AsArray, StorageIter},
@@ -227,7 +227,7 @@ mod tests {
 
         assert!(iter.valid());
         assert_eq!(iter.key().unwrap(), b"k1" as &[u8]);
-        assert_eq!(BlockHandle::from(iter.value().unwrap()).offset, 0xAB);
+        assert_eq!(Position::from(iter.value().unwrap()).offset, 0xAB);
     }
 
     #[test]
@@ -243,7 +243,7 @@ mod tests {
         iter.seek(&&b"k2"[..]).unwrap();
 
         assert!(iter.valid());
-        assert_eq!(BlockHandle::from(iter.value().unwrap()).offset, 0x20);
+        assert_eq!(Position::from(iter.value().unwrap()).offset, 0x20);
     }
 
     #[test]

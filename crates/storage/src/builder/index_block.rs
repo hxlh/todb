@@ -1,6 +1,6 @@
 use bytes::{Bytes, BytesMut};
 
-use crate::{block::BlockHandle, builder::SstOption};
+use crate::{block::Position, builder::SstOption};
 
 const INDEX_VALUE_VERSION: u8 = 1;
 const INDEX_VALUE_LEN: usize = 1 + size_of::<u64>();
@@ -18,7 +18,7 @@ const BLOCK_FIXED_HEADER_SIZE: usize = 12;
 #[derive(Debug, Clone)]
 pub struct IndexEntry {
     pub end_key: Bytes,
-    pub child: BlockHandle,
+    pub child: Position,
 }
 
 /// Builds an index block from sorted index entries.
@@ -37,7 +37,7 @@ impl IndexBlockBuilder {
         }
     }
 
-    pub fn add(&mut self, end_key: Bytes, child: BlockHandle) {
+    pub fn add(&mut self, end_key: Bytes, child: Position) {
         assert!(BLOCK_FIXED_HEADER_SIZE + end_key.len() + 17 < self.option.block_size);
         self.estimated_size += end_key.len() + 17;
         self.entries.push(IndexEntry { end_key, child });
@@ -47,7 +47,7 @@ impl IndexBlockBuilder {
         self.estimated_size
     }
 
-    pub fn would_exceed(&self, end_key: &Bytes, _child: &BlockHandle) -> bool {
+    pub fn would_exceed(&self, end_key: &Bytes, _child: &Position) -> bool {
         BLOCK_FIXED_HEADER_SIZE + self.estimated_size + end_key.len() + 17 > self.option.block_size
     }
 
@@ -114,6 +114,7 @@ impl IndexBlockBuilder {
             buf.extend_from_slice(&entry.child.offset.to_be_bytes());
         }
 
+        buf.resize(self.option.block_size, 0);
         self.reset();
         buf.freeze()
     }
@@ -138,7 +139,7 @@ mod tests {
         let mut b = IndexBlockBuilder::new(&option());
         let buf = b.finish();
         // header = count(4) + key_sentinel(4) + val_sentinel(4) = 12
-        assert_eq!(buf.len(), 12);
+        assert_eq!(buf.len(), option().block_size);
         assert_eq!(&buf[..4], &0u32.to_be_bytes());
     }
 
@@ -146,7 +147,7 @@ mod tests {
     #[test]
     fn test_single_entry_layout() {
         let mut b = IndexBlockBuilder::new(&option());
-        b.add(Bytes::from("k"), BlockHandle { offset: 0xAB });
+        b.add(Bytes::from("k"), Position { offset: 0xAB });
         let buf = b.finish();
 
         // count = 1
@@ -160,15 +161,15 @@ mod tests {
         assert_eq!(&buf[20..21], b"k");
         assert_eq!(buf[21], 1);
         assert_eq!(u64::from_be_bytes(buf[22..30].try_into().unwrap()), 0xAB);
-        assert_eq!(buf.len(), 30);
+        assert_eq!(buf.len(), option().block_size);
     }
 
     // Two entries: offsets, keys, and child handles must be correctly positioned.
     #[test]
     fn test_two_entry_layout() {
         let mut b = IndexBlockBuilder::new(&option());
-        b.add(Bytes::from("ab"), BlockHandle { offset: 0x10 });
-        b.add(Bytes::from("c"), BlockHandle { offset: 0x20 });
+        b.add(Bytes::from("ab"), Position { offset: 0x10 });
+        b.add(Bytes::from("c"), Position { offset: 0x20 });
         let buf = b.finish();
 
         // count = 2
@@ -205,23 +206,23 @@ mod tests {
     #[test]
     fn test_size_estimation_accounts_for_versioned_index_value() {
         let mut b = IndexBlockBuilder::new(&option());
-        b.add(Bytes::from("ab"), BlockHandle { offset: 1 });
+        b.add(Bytes::from("ab"), Position { offset: 1 });
         assert_eq!(b.estimated_size(), 19);
-        assert!(!b.would_exceed(&Bytes::from("c"), &BlockHandle { offset: 2 }));
+        assert!(!b.would_exceed(&Bytes::from("c"), &Position { offset: 2 }));
     }
 
     #[test]
     fn test_would_exceed_accounts_for_fixed_header() {
         let option = SstOption::default().block_size(29);
         let b = IndexBlockBuilder::new(&option);
-        assert!(b.would_exceed(&Bytes::from("k"), &BlockHandle { offset: 1 }));
+        assert!(b.would_exceed(&Bytes::from("k"), &Position { offset: 1 }));
     }
 
     // finish() resets the builder so it can be reused.
     #[test]
     fn test_finish_resets_builder() {
         let mut b = IndexBlockBuilder::new(&option());
-        b.add(Bytes::from("k"), BlockHandle { offset: 1 });
+        b.add(Bytes::from("k"), Position { offset: 1 });
         let _ = b.finish();
         assert!(b.is_empty());
         assert_eq!(b.estimated_size(), 0);

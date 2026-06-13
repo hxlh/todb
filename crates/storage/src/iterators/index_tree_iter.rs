@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    block::{BlockHandle, BlockReader},
+    block::{BlockReader, Position},
     builder::{SstFooter, SstOption},
     errors::{StorageError, StorageResult},
     iterators::{
@@ -20,8 +20,7 @@ pub struct IndexTreeIter<R, I: IndexBlockIter = NormalBlockIter> {
     #[allow(dead_code)]
     option: SstOption,
     tree_height: usize,
-    root_handle: BlockHandle,
-    /// One iterator per index level; format determined by I.
+    root_position: Position,
     /// iters[0] = root, iters[tree_height-2] = leaf index level.
     index_iters: Vec<IndexEntryDecodeIter<I>>,
     curr_iter_idx: usize,
@@ -38,7 +37,7 @@ where
             reader,
             option: option.clone(),
             tree_height: footer.tree_height as usize,
-            root_handle: footer.root_handle,
+            root_position: footer.root_position,
             index_iters: Vec::new(),
             curr_iter_idx: 0,
         };
@@ -62,7 +61,7 @@ where
         }
         self.reset();
 
-        let root_block = self.reader.read_block(&self.root_handle)?;
+        let root_block = self.reader.read_block(&self.root_position)?;
         let mut root_iter = IndexEntryDecodeIter::new(I::from_block(root_block)?);
         if let Some(target) = target {
             root_iter.seek(target)?;
@@ -91,13 +90,13 @@ where
                 continue;
             }
 
-            let next_level_handle: BlockHandle = curr_iter
+            let next_level_position: Position = curr_iter
                 .value()
                 .ok_or_else(|| StorageError::InvalidValue("iter values not exists".into()))?
                 .into();
 
             // create child iter
-            let block = self.reader.read_block(&next_level_handle)?;
+            let block = self.reader.read_block(&next_level_position)?;
             let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
             if let Some(target) = target {
                 child_iter.seek(target)?;
@@ -141,13 +140,13 @@ where
             }
 
             // if not leaf, move to next child iter
-            let next_level_handle: BlockHandle = curr_iter
+            let next_level_position: Position = curr_iter
                 .value()
                 .ok_or_else(|| StorageError::InvalidValue("iter values not exists".into()))?
                 .into();
 
             // create child iter
-            let block = self.reader.read_block(&next_level_handle)?;
+            let block = self.reader.read_block(&next_level_position)?;
             let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
             child_iter.seek_to_first()?;
             debug!(
@@ -176,7 +175,7 @@ where
 {
     type Key<'a> = I::Key<'a>;
     type Value<'a>
-        = BlockHandle
+        = Position
     where
         Self: 'a;
 
@@ -229,9 +228,8 @@ mod tests {
     use crate::testing::init_tracing;
     use crate::{
         block::{BlockReader, InMemoryBlockReader, InMemoryBlockWriter},
-        builder::{SstBuilder, SstFooter, SstOption},
+        builder::{DefaultSstWriter, SstBuilder, SstFooter, SstOption},
         iterators::iter::StorageIter,
-        row_key::BinaryKey,
     };
 
     fn make_key(i: u64) -> Bytes {
@@ -241,15 +239,14 @@ mod tests {
     fn make_value(i: u64) -> Bytes {
         Bytes::from(format!("v{}", i))
     }
-
     fn build_sst(n: u64, block_size: usize) -> (Vec<u8>, SstFooter, SstOption) {
         let option = SstOption::default().block_size(block_size);
-        let mut builder = SstBuilder::new(InMemoryBlockWriter::new(), option.clone());
+        let mut builder = SstBuilder::new(DefaultSstWriter::new(InMemoryBlockWriter::new(), &option), option.clone());
         for i in 0..n {
             builder.add(make_key(i), make_value(i)).unwrap();
         }
-        let (footer, writer) = builder.finish().unwrap();
-        (writer.into_inner(), footer, option)
+        let (footer, sst_writer) = builder.finish().unwrap();
+        (sst_writer.into_inner().into_inner(), footer, option)
     }
 
     fn make_iter(n: u64, block_size: usize) -> IndexTreeIter<InMemoryBlockReader> {
@@ -334,7 +331,7 @@ mod tests {
         let (bytes, footer, option) = build_sst(200, 256);
         let mut raw = bytes;
 
-        let root_offset = footer.root_handle.offset as usize;
+        let root_offset = footer.root_position.offset as usize;
         let root_block_len = 256.min(raw.len() - root_offset);
         let root_block = &raw[root_offset..root_offset + root_block_len];
         let count = u32::from_be_bytes(root_block[0..4].try_into().unwrap()) as usize;

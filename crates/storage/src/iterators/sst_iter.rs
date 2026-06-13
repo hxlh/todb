@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
-    block::{BlockHandle, BlockReader},
+    block::{Position, BlockReader},
     builder::{SstFooter, SstOption},
     errors::{StorageError, StorageResult},
     iterators::{
@@ -66,10 +66,10 @@ where
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.index_iter.seek_to_first()?;
         if self.index_iter.valid() {
-            let handle: BlockHandle = self.index_iter.value().ok_or_else(|| {
+            let pos: Position = self.index_iter.value().ok_or_else(|| {
                 StorageError::InvalidValue("index iter valid but value is none".into())
             })?;
-            let block = self.reader.read_block(&handle)?;
+            let block = self.reader.read_block(&pos)?;
             let mut d = D::from_block(block)?;
             d.seek_to_first()?;
             self.data_iter = Some(d);
@@ -81,10 +81,10 @@ where
         // target: &D::Key<'a> = &I::Key<'a> (enforced by the Key equality bound)
         self.index_iter.seek(target)?;
         if self.index_iter.valid() {
-            let handle: BlockHandle = self.index_iter.value().ok_or_else(|| {
+            let pos: Position = self.index_iter.value().ok_or_else(|| {
                 StorageError::InvalidValue("index iter valid but value is none".into())
             })?;
-            let block = self.reader.read_block(&handle)?;
+            let block = self.reader.read_block(&pos)?;
             let mut d = D::from_block(block)?;
             d.seek(target)?;
             self.data_iter = Some(d);
@@ -102,10 +102,10 @@ where
                 if !self.index_iter.valid() {
                     return Ok(());
                 }
-                let handle: BlockHandle = self.index_iter.value().ok_or_else(|| {
+                let pos: Position = self.index_iter.value().ok_or_else(|| {
                     StorageError::InvalidValue("index iter valid but value is none".into())
                 })?;
-                let block = self.reader.read_block(&handle)?;
+                let block = self.reader.read_block(&pos)?;
                 let mut d = D::from_block(block)?;
                 d.seek_to_first()?;
                 self.data_iter = Some(d);
@@ -131,13 +131,12 @@ mod tests {
 
     use crate::{
         block::{InMemoryBlockReader, InMemoryBlockWriter},
-        builder::{SstBuilder, SstFooter, SstOption},
+        builder::{DefaultSstWriter, SstBuilder, SstFooter, SstOption},
         iterators::{
             block_iter::NormalBlockIter,
             entry_decode_iter::EntryDecodeIter,
             iter::{AsArray, StorageIter},
         },
-        row_key::RowKey,
         testing::init_tracing,
     };
 
@@ -153,12 +152,12 @@ mod tests {
 
     fn build_sst(n: u64, block_size: usize) -> (Vec<u8>, SstFooter, SstOption) {
         let option = SstOption::default().block_size(block_size);
-        let mut builder = SstBuilder::new(InMemoryBlockWriter::new(), option.clone());
+        let mut builder = SstBuilder::new(DefaultSstWriter::new(InMemoryBlockWriter::new(), &option), option.clone());
         for i in 0..n {
             builder.add(make_key(i), make_value(i)).unwrap();
         }
-        let (footer, writer) = builder.finish().unwrap();
-        (writer.into_inner(), footer, option)
+        let (footer, sst_writer) = builder.finish().unwrap();
+        (sst_writer.into_inner().into_inner(), footer, option)
     }
     fn make_iter(
         n: u64,

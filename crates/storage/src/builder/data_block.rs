@@ -124,6 +124,7 @@ impl DataBlockBuilder {
             buf.extend_from_slice(value);
         }
 
+        buf.resize(self.option.block_size, 0);
         self.reset();
         buf.freeze()
     }
@@ -148,7 +149,7 @@ mod tests {
         let mut b = DataBlockBuilder::new(&option());
         let buf = b.finish();
         // header = count(4) + key_sentinel(4) + val_sentinel(4) = 12
-        assert_eq!(buf.len(), 12);
+        assert_eq!(buf.len(), option().block_size);
         assert_eq!(&buf[..4], &0u32.to_be_bytes());
     }
 
@@ -169,7 +170,7 @@ mod tests {
         assert_eq!(u32::from_be_bytes(buf[16..20].try_into().unwrap()), 24);
         assert_eq!(&buf[20..21], b"k");
         assert_eq!(&buf[21..24], &[1, 0, b'v']);
-        assert_eq!(buf.len(), 24);
+        assert_eq!(buf.len(), option().block_size);
     }
 
     // Two entries: offsets must be contiguous and non-overlapping.

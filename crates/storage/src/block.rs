@@ -4,13 +4,13 @@ use bytes::Bytes;
 
 use crate::errors::StorageResult;
 
-/// Handle to a block written to the SST file.
+/// File position, currently a byte offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlockHandle {
+pub struct Position {
     pub offset: u64,
 }
 
-impl From<&[u8]> for BlockHandle {
+impl From<&[u8]> for Position {
     fn from(value: &[u8]) -> Self {
         assert_eq!(value.len(), 8);
         Self {
@@ -21,7 +21,7 @@ impl From<&[u8]> for BlockHandle {
 
 /// Abstraction over block write targets (file, memory, etc.).
 pub trait BlockWriter {
-    fn write_block<T: AsRef<[u8]>>(&mut self, data: &T) -> StorageResult<BlockHandle>;
+    fn write_block<T: AsRef<[u8]>>(&mut self, data: T) -> StorageResult<Position>;
 }
 
 /// In-memory block writer for testing.
@@ -49,12 +49,12 @@ impl InMemoryBlockWriter {
 }
 
 impl BlockWriter for InMemoryBlockWriter {
-    fn write_block<T: AsRef<[u8]>>(&mut self, data: &T) -> StorageResult<BlockHandle> {
+    fn write_block<T: AsRef<[u8]>>(&mut self, data: T) -> StorageResult<Position> {
         let offset = self.next_offset;
         let size = data.as_ref().len() as u64;
         self.buf.extend_from_slice(data.as_ref());
         self.next_offset += size;
-        Ok(BlockHandle { offset })
+        Ok(Position { offset })
     }
 }
 
@@ -81,26 +81,26 @@ impl FileBlockWriter {
 }
 
 impl BlockWriter for FileBlockWriter {
-    fn write_block<T: AsRef<[u8]>>(&mut self, data: &T) -> StorageResult<BlockHandle> {
+    fn write_block<T: AsRef<[u8]>>(&mut self, data: T) -> StorageResult<Position> {
         use std::io::Write;
         let offset = self.next_offset;
         let size = data.as_ref().len() as u64;
         self.file.write_all(data.as_ref())?;
         self.next_offset += size;
-        Ok(BlockHandle { offset })
+        Ok(Position { offset })
     }
 }
 
 /// Abstraction over block read sources (file, memory, etc.).
 pub trait BlockReader {
-    fn read_block(&self, handle: &BlockHandle) -> StorageResult<Bytes>;
+    fn read_block(&self, position: &Position) -> StorageResult<Bytes>;
     fn block_size(&self) -> usize;
 }
 
 /// Allow Arc<R> to be used wherever R: BlockReader is expected.
 impl<R: BlockReader> BlockReader for std::sync::Arc<R> {
-    fn read_block(&self, handle: &BlockHandle) -> StorageResult<Bytes> {
-        (**self).read_block(handle)
+    fn read_block(&self, position: &Position) -> StorageResult<Bytes> {
+        (**self).read_block(position)
     }
     fn block_size(&self) -> usize {
         (**self).block_size()
@@ -108,7 +108,7 @@ impl<R: BlockReader> BlockReader for std::sync::Arc<R> {
 }
 
 /// In-memory block reader for testing.
-/// Reads blocks from a shared `Bytes` buffer using offset/size handles.
+/// Reads blocks from a shared `Bytes` buffer using offset-only position.
 pub struct InMemoryBlockReader {
     buf: Bytes,
     block_size: usize,
@@ -121,14 +121,13 @@ impl InMemoryBlockReader {
 }
 
 impl BlockReader for InMemoryBlockReader {
-    fn read_block(&self, handle: &BlockHandle) -> StorageResult<Bytes> {
-        let start = handle.offset as usize;
+    fn read_block(&self, position: &Position) -> StorageResult<Bytes> {
+        let start = position.offset as usize;
         if start > self.buf.len() {
             return Err(crate::errors::StorageError::InvalidKey(
-                "block handle out of bounds".into(),
+                "position out of bounds".into(),
             ));
         }
-        // Last block may be shorter than block_size; return what is available.
         let end = (start + self.block_size).min(self.buf.len());
         Ok(self.buf.slice(start..end))
     }
@@ -142,11 +141,11 @@ impl BlockReader for InMemoryBlockReader {
 mod tests {
     use super::*;
 
-    // BlockHandle should only contain offset, no size field.
+    // Position only contains offset; block size is known by reader/sst_writer.
     #[test]
-    fn test_block_handle_has_no_size() {
-        let h = BlockHandle { offset: 42 };
-        assert_eq!(h.offset, 42);
+    fn test_position_is_offset_only() {
+        let p = Position { offset: 42 };
+        assert_eq!(p.offset, 42);
     }
 
     // BlockReader must report the block_size it was constructed with.
@@ -156,61 +155,65 @@ mod tests {
         assert_eq!(reader.block_size(), 4096);
     }
 
-    // Reader reads exactly block_size bytes from the given offset.
+    // Reader reads exactly block_size bytes from the given position.
     #[test]
     fn test_reader_reads_fixed_size_block() -> StorageResult<()> {
         let block_size = 4;
         let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
         let reader = InMemoryBlockReader::new(Bytes::from(data), block_size);
 
-        let b0 = reader.read_block(&BlockHandle { offset: 0 })?;
-        let b1 = reader.read_block(&BlockHandle { offset: 4 })?;
+        let b0 = reader.read_block(&Position { offset: 0 })?;
+        let b1 = reader.read_block(&Position { offset: 4 })?;
 
         assert_eq!(b0.as_ref(), &[1, 2, 3, 4]);
         assert_eq!(b1.as_ref(), &[5, 6, 7, 8]);
         Ok(())
     }
 
-    // Last block may be smaller than block_size; reader returns what is available.
+    // Last block may be shorter than block_size; reader returns what is available.
     #[test]
     fn test_reader_handles_short_last_block() -> StorageResult<()> {
         let block_size = 4;
-        // Only 3 bytes after offset 4
         let data = vec![0u8, 0, 0, 0, 9, 8, 7];
         let reader = InMemoryBlockReader::new(Bytes::from(data), block_size);
 
-        let b = reader.read_block(&BlockHandle { offset: 4 })?;
+        let b = reader.read_block(&Position { offset: 4 })?;
         assert_eq!(b.as_ref(), &[9, 8, 7]);
         Ok(())
     }
 
-    // BlockWriter must report the block_size it was constructed with.
+    // InMemoryBlockWriter is raw I/O: appends bytes, returns Position.
     #[test]
-    fn test_writer_reports_block_size() {
-        // BlockWriter no longer exposes block_size; size is owned by SstOption.
-        // This test is intentionally left as a compile-time marker.
-        let _writer = InMemoryBlockWriter::new();
+    fn test_in_memory_writer_appends_and_returns_position() -> StorageResult<()> {
+        let mut writer = InMemoryBlockWriter::new();
+
+        let p1 = writer.write_block(vec![1u8, 2, 3])?;
+        let p2 = writer.write_block(vec![4u8, 5])?;
+
+        assert_eq!(p1, Position { offset: 0 });
+        assert_eq!(p2, Position { offset: 3 });
+        assert_eq!(writer.as_slice(), &[1, 2, 3, 4, 5]);
+        Ok(())
     }
 
+    // Writer + reader round-trip with same-size blocks.
     #[test]
-    fn test_in_memory_writer_simple_read_write() -> StorageResult<()> {
-        // block_size matches each written block so reads return exactly one block.
+    fn test_writer_reader_round_trip() -> StorageResult<()> {
         let block_size = 4;
-        let data = vec![0u8, 1, 2, 3];
-        let data2 = vec![3u8, 2, 1, 0];
+        let mut writer = InMemoryBlockWriter::new();
 
-        let mut w = InMemoryBlockWriter::new();
-        let handle1 = w.write_block(&data)?;
-        let handle2 = w.write_block(&data2)?;
+        let p1 = writer.write_block(vec![0u8, 1, 2, 3])?;
+        let p2 = writer.write_block(vec![3u8, 2, 1, 0])?;
 
-        let reader = InMemoryBlockReader::new(Bytes::from(w.into_inner()), block_size);
-        let b1 = reader.read_block(&handle1)?;
-        let b2 = reader.read_block(&handle2)?;
+        assert_eq!(p1, Position { offset: 0 });
+        assert_eq!(p2, Position { offset: 4 });
 
-        assert_eq!(b1.as_ref(), data.as_slice());
-        assert_ne!(b2.as_ref(), [1, 2, 3, 4]);
-        assert_eq!(b2.as_ref(), data2.as_slice());
+        let reader = InMemoryBlockReader::new(Bytes::from(writer.into_inner()), block_size);
+        let b1 = reader.read_block(&p1)?;
+        let b2 = reader.read_block(&p2)?;
 
+        assert_eq!(b1.as_ref(), &[0, 1, 2, 3]);
+        assert_eq!(b2.as_ref(), &[3, 2, 1, 0]);
         Ok(())
     }
 }

@@ -21,7 +21,7 @@ pub trait StorageIter {
 }
 
 /// Abstracts the format of an index block.
-/// Implementations yield (key, BlockHandle) pairs from raw block bytes.
+/// Implementations yield (key, Position) pairs from raw block bytes.
 /// Different index formats (B+tree node, prefix-compressed, etc.) implement this.
 pub trait IndexBlockIter: StorageIter + Sized {
     fn from_block(block: Bytes) -> StorageResult<Self>;
