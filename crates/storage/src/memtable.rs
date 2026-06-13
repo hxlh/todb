@@ -12,7 +12,7 @@ use ouroboros::self_referencing;
 
 use crate::{
     errors::StorageResult,
-    iterators::{entry_decode_iter::EntryValue, iter::StorageIter, map_iter::MappedStorageIter},
+    iterators::{entry_decode_iter::EntryValue, storage_iter::StorageIter, map_iter::MappedStorageIter},
     row_key::RowKey,
 };
 
@@ -290,7 +290,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::iterators::iter::StorageIter;
+    use crate::iterators::storage_iter::StorageIter;
 
     fn k(s: &str) -> Bytes {
         Bytes::from(s.to_string())

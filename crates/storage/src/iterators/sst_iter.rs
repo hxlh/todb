@@ -8,7 +8,7 @@ use crate::{
         block_iter::NormalBlockIter,
         entry_decode_iter::EntryDecodeIter,
         index_tree_iter::IndexTreeIter,
-        iter::{AsArray, DataBlockIter, IndexBlockIter, StorageIter},
+        storage_iter::{AsArray, DataBlockIter, IndexBlockIter, StorageIter},
     },
 };
 
@@ -135,7 +135,7 @@ mod tests {
         iterators::{
             block_iter::NormalBlockIter,
             entry_decode_iter::EntryDecodeIter,
-            iter::{AsArray, StorageIter},
+            storage_iter::{AsArray, StorageIter},
         },
         testing::init_tracing,
     };

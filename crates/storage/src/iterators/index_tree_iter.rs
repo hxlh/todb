@@ -7,9 +7,8 @@ use crate::{
     iterators::{
         block_iter::NormalBlockIter,
         index_entry_decode_iter::IndexEntryDecodeIter,
-        iter::{AsArray, IndexBlockIter, StorageIter},
+        storage_iter::{AsArray, IndexBlockIter, StorageIter},
     },
-    row_key::RowKey,
 };
 
 use tracing::{debug, span};
@@ -229,7 +228,7 @@ mod tests {
     use crate::{
         block::{BlockReader, InMemoryBlockReader, InMemoryBlockWriter},
         builder::{DefaultSstWriter, SstBuilder, SstFooter, SstOption},
-        iterators::iter::StorageIter,
+        iterators::storage_iter::StorageIter,
     };
 
     fn make_key(i: u64) -> Bytes {

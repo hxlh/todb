@@ -1,4 +1,4 @@
-use crate::{errors::StorageResult, iterators::iter::StorageIter};
+use crate::{errors::StorageResult, iterators::storage_iter::StorageIter};
 
 enum Current {
     A,
@@ -121,7 +121,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iterators::iter::StorageIter;
+    use crate::iterators::storage_iter::StorageIter;
 
     struct VecIter {
         data: Vec<(&'static [u8], &'static [u8])>,

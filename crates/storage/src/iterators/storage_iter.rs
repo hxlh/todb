@@ -32,3 +32,4 @@ pub trait IndexBlockIter: StorageIter + Sized {
 pub trait DataBlockIter: StorageIter + Sized {
     fn from_block(block: Bytes) -> StorageResult<Self>;
 }
+

@@ -1,4 +1,4 @@
-use crate::{errors::StorageResult, iterators::iter::StorageIter};
+use crate::{errors::StorageResult, iterators::storage_iter::StorageIter};
 
 /// Extension of [`StorageIter`] that defines how an iterator's native
 /// key/value types are exposed to merge layers.

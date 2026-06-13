@@ -3,7 +3,7 @@ use bytes::Bytes;
 use crate::{
     iterators::{
         entry_decode_iter::EntryValue,
-        iter::StorageIter,
+        storage_iter::StorageIter,
         map_iter::MapIter,
         merge_iter::MergeIter,
         two_merge_iter::TwoMergeIter,

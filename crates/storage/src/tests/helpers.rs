@@ -5,7 +5,7 @@ use bytes::Bytes;
 use crate::{
     block::{InMemoryBlockReader, InMemoryBlockWriter},
     builder::{DefaultSstWriter, SstBuilder, SstFooter, SstOption},
-    iterators::{iter::StorageIter, sst_iter::SstIter},
+    iterators::{storage_iter::StorageIter, sst_iter::SstIter},
 };
 
 pub fn make_key(i: u64) -> Bytes {

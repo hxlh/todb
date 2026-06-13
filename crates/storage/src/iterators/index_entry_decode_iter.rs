@@ -1,7 +1,7 @@
 use crate::{
     block::Position,
     errors::{StorageError, StorageResult},
-    iterators::iter::{AsArray, StorageIter},
+    iterators::storage_iter::{AsArray, StorageIter},
 };
 
 const INDEX_VALUE_VERSION: u8 = 1;
@@ -145,7 +145,7 @@ mod tests {
         block::Position,
         iterators::{
             block_iter::RawEntry,
-            iter::{AsArray, StorageIter},
+            storage_iter::StorageIter,
         },
     };
 

@@ -8,7 +8,7 @@ use crate::{
     iterators::{
         block_iter::NormalBlockIter,
         entry_decode_iter::EntryDecodeIter,
-        iter::{AsArray, StorageIter},
+        storage_iter::{AsArray, StorageIter},
         sst_iter::SstIter,
     },
     row_key::RowKey,

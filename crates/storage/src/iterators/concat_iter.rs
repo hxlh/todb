@@ -1,4 +1,4 @@
-use crate::{errors::StorageResult, iterators::iter::StorageIter};
+use crate::{errors::StorageResult, iterators::storage_iter::StorageIter};
 
 // Concatenates multiple ordered, non-overlapping SST iterators into a single
 // sequential iterator. SSTs must be provided in ascending key order.

@@ -1,6 +1,6 @@
 use crate::{
     block::InMemoryBlockReader,
-    iterators::{iter::StorageIter, merge_iter::MergeIter, sst_iter::SstIter},
+    iterators::{merge_iter::MergeIter, storage_iter::StorageIter, sst_iter::SstIter},
     row_key::RowKey,
 };
 

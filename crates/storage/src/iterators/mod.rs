@@ -1,12 +1,14 @@
 pub mod block_iter;
 pub mod concat_iter;
 mod index_tree_iter;
-pub mod iter;
 pub mod map_iter;
 pub mod merge_iter;
+pub mod scan_iter;
 pub mod sst_iter;
+pub mod storage_iter;
 pub mod two_merge_iter;
 pub use entry_decode_iter::EntryValue;
 pub use two_merge_iter::TwoMergeIter;
 pub(crate) mod entry_decode_iter;
 pub(crate) mod index_entry_decode_iter;
+pub use scan_iter::{ScanAdapter, ScanIter};

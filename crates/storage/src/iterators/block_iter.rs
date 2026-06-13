@@ -6,7 +6,7 @@ use tracing::debug;
 
 use crate::{
     errors::StorageResult,
-    iterators::iter::{AsArray, DataBlockIter, IndexBlockIter, StorageIter},
+    iterators::storage_iter::{AsArray, DataBlockIter, IndexBlockIter, StorageIter},
     row_key::{BinaryKey, RowKey},
 };
 
@@ -178,7 +178,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::{
-        iterators::{entry_decode_iter::EntryDecodeIter, iter::{AsArray, StorageIter}},
+        iterators::storage_iter::{AsArray, StorageIter},
         row_key::BinaryKey,
     };
 

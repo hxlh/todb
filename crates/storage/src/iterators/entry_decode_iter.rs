@@ -2,7 +2,7 @@ use bytes::Bytes;
 
 use crate::{
     errors::{StorageError, StorageResult},
-    iterators::iter::{AsArray, DataBlockIter, StorageIter},
+    iterators::storage_iter::{AsArray, DataBlockIter, StorageIter},
 };
 
 const DATA_ENTRY_VERSION: u8 = 1;
@@ -134,6 +134,15 @@ pub enum EntryValue<'a> {
     Delete,
 }
 
+impl<'a> From<EntryValue<'a>> for crate::memtable::Entry<&'a [u8]> {
+    fn from(v: EntryValue<'a>) -> Self {
+        match v {
+            EntryValue::Put(data) => Self::Put(data),
+            EntryValue::Delete => Self::Delete,
+        }
+    }
+}
+
 impl<'a> AsArray<'a> for EntryValue<'a> {
     fn as_array(&self) -> &'a [u8] {
         match self {
@@ -158,7 +167,7 @@ enum EntryKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{iterators::block_iter::RawEntry, iterators::iter::StorageIter};
+    use crate::{iterators::block_iter::RawEntry, iterators::storage_iter::StorageIter};
 
     struct VecEntryIter {
         entries: Vec<(&'static [u8], &'static [u8])>,

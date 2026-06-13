@@ -1,3 +1,5 @@
+use crate::iterators::storage_iter::AsArray;
+
 pub type RowKey<'a> = BinaryKey<'a>;
 
 #[derive(Debug)]
@@ -22,6 +24,12 @@ where
 
 impl<'a> AsRef<[u8]> for BinaryKey<'a> {
     fn as_ref(&self) -> &[u8] {
+        self.buf
+    }
+}
+
+impl<'a> AsArray<'a> for BinaryKey<'a> {
+    fn as_array(&self) -> &'a [u8] {
         self.buf
     }
 }
