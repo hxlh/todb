@@ -17,10 +17,50 @@ const DATA_ENTRY_HEADER_LEN: usize = 2;
 // Each entry contributes one key offset and one value offset (u32 + u32).
 const PER_ENTRY_OFFSET_TABLE_BYTES: usize = 8;
 
+// Entry kind byte values — must match [`crate::iterators::entry_decode_iter`].
+const KIND_PUT: u8 = 0;
+const KIND_DELETE: u8 = 1;
+
+/// A data block entry: a live value or a delete tombstone.
+pub(crate) enum BlockEntry {
+    Put(Bytes, Bytes),
+    Delete(Bytes),
+}
+
+impl BlockEntry {
+    fn key(&self) -> &Bytes {
+        match self {
+            BlockEntry::Put(k, _) => k,
+            BlockEntry::Delete(k) => k,
+        }
+    }
+
+    fn value_len(&self) -> usize {
+        match self {
+            BlockEntry::Put(_, v) => v.len(),
+            BlockEntry::Delete(_) => 0,
+        }
+    }
+
+    fn kind_byte(&self) -> u8 {
+        match self {
+            BlockEntry::Put(_, _) => KIND_PUT,
+            BlockEntry::Delete(_) => KIND_DELETE,
+        }
+    }
+
+    fn value(&self) -> &[u8] {
+        match self {
+            BlockEntry::Put(_, v) => v,
+            BlockEntry::Delete(_) => &[],
+        }
+    }
+}
+
 /// Builds a data block from sorted (key, value) entries.
 pub struct DataBlockBuilder {
     option: SstOption,
-    entries: Vec<(Bytes, Bytes)>,
+    entries: Vec<BlockEntry>,
     estimated_size: usize,
 }
 
@@ -44,7 +84,15 @@ impl DataBlockBuilder {
         // The invariant 12-byte block prefix is accounted for separately by
         // `BLOCK_FIXED_HEADER_SIZE` in `would_exceed()` and the assertion above.
         self.estimated_size += entry_size;
-        self.entries.push((key, value));
+        self.entries.push(BlockEntry::Put(key, value));
+    }
+
+    /// Add a delete tombstone. `value_len` is 0; only the key is stored.
+    pub fn add_delete(&mut self, key: Bytes) {
+        let entry_size = key.len() + PER_ENTRY_OFFSET_TABLE_BYTES + DATA_ENTRY_HEADER_LEN;
+        assert!(BLOCK_FIXED_HEADER_SIZE + entry_size < self.option.block_size);
+        self.estimated_size += entry_size;
+        self.entries.push(BlockEntry::Delete(key));
     }
 
     pub fn estimated_size(&self) -> usize {
@@ -66,7 +114,7 @@ impl DataBlockBuilder {
     }
 
     pub fn last_key(&self) -> Option<&Bytes> {
-        self.entries.last().map(|(k, _)| k)
+        self.entries.last().map(|e| e.key())
     }
 
     /// Encode entries into a data block.
@@ -93,15 +141,15 @@ impl DataBlockBuilder {
         let mut key_offsets = Vec::with_capacity(self.entries.len() + 1);
         let mut val_offsets = Vec::with_capacity(self.entries.len() + 1);
 
-        for (key, _value) in &self.entries {
+        for entry in &self.entries {
             key_offsets.push(data_offset as u32);
-            data_offset += key.len();
+            data_offset += entry.key().len();
         }
         key_offsets.push(data_offset as u32); // key sentinel = start of value area
 
-        for (_key, value) in &self.entries {
+        for entry in &self.entries {
             val_offsets.push(data_offset as u32);
-            data_offset += DATA_ENTRY_HEADER_LEN + value.len();
+            data_offset += DATA_ENTRY_HEADER_LEN + entry.value_len();
         }
         val_offsets.push(data_offset as u32); // value sentinel = end of block
 
@@ -114,14 +162,14 @@ impl DataBlockBuilder {
         }
 
         // Write key bytes
-        for (key, _value) in &self.entries {
-            buf.extend_from_slice(key);
+        for entry in &self.entries {
+            buf.extend_from_slice(entry.key());
         }
 
-        // Write entry-encoded value bytes: [version][kind=Put][payload]
-        for (_key, value) in &self.entries {
-            buf.extend_from_slice(&[DATA_ENTRY_VERSION, 0]);
-            buf.extend_from_slice(value);
+        // Write entry-encoded value bytes: [version][kind][payload]
+        for entry in &self.entries {
+            buf.extend_from_slice(&[DATA_ENTRY_VERSION, entry.kind_byte()]);
+            buf.extend_from_slice(entry.value());
         }
 
         buf.resize(self.option.block_size, 0);
@@ -202,6 +250,21 @@ mod tests {
         assert_eq!(&buf[key1..key_sent], b"c");
         assert_eq!(&buf[val0..val1], &[1, 0, b'x', b'y']);
         assert_eq!(&buf[val1..val_sent], &[1, 0, b'z']);
+    }
+
+    // Delete tombstone encodes as kind=1 with empty payload.
+    #[test]
+    fn test_delete_entry_layout() {
+        let mut b = DataBlockBuilder::new(&option());
+        b.add_delete(Bytes::from("k"));
+        let buf = b.finish();
+
+        // count = 1, header_size = 20
+        assert_eq!(u32::from_be_bytes(buf[0..4].try_into().unwrap()), 1);
+        // key at offset 20, value at offset 21
+        assert_eq!(&buf[20..21], b"k");
+        // value = [version=1][kind=1] (delete, no payload)
+        assert_eq!(&buf[21..23], &[1, 1]);
     }
 
     #[test]

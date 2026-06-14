@@ -64,6 +64,15 @@ impl<S: SstWriter> SstBuilder<S> {
         Ok(())
     }
 
+    /// Add a delete tombstone. Caller must guarantee keys are in ascending order.
+    pub fn add_delete(&mut self, key: Bytes) -> StorageResult<()> {
+        if self.data_builder.would_exceed(&key, &Bytes::new()) {
+            self.flush_data_block()?;
+        }
+        self.data_builder.add_delete(key);
+        Ok(())
+    }
+
     fn flush_data_block(&mut self) -> StorageResult<()> {
         if self.data_builder.is_empty() {
             return Ok(());
@@ -141,7 +150,7 @@ impl<S: SstWriter> SstBuilder<S> {
             .unwrap_or(Position { offset: 0 });
 
         let footer = SstFooter {
-            root_position,
+            root_index_block_position: root_position,
             tree_height: height,
         };
 
@@ -153,7 +162,7 @@ impl<S: SstWriter> SstBuilder<S> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SstFooter {
-    pub root_position: Position,
+    pub root_index_block_position: Position,
     pub tree_height: u32,
 }
 
@@ -162,7 +171,7 @@ impl SstFooter {
 
     pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
         let mut buf = [0u8; Self::ENCODED_LEN];
-        buf[0..8].copy_from_slice(&self.root_position.offset.to_be_bytes());
+        buf[0..8].copy_from_slice(&self.root_index_block_position.offset.to_be_bytes());
         buf[8..12].copy_from_slice(&self.tree_height.to_be_bytes());
         buf
     }
@@ -174,7 +183,7 @@ impl SstFooter {
             ));
         }
         Ok(Self {
-            root_position: Position {
+            root_index_block_position: Position {
                 offset: u64::from_be_bytes(buf[0..8].try_into().unwrap()),
             },
             tree_height: u32::from_be_bytes(buf[8..12].try_into().unwrap()),
@@ -231,13 +240,13 @@ mod tests {
         let writer = sst_writer.into_inner();
         let buf = writer.into_inner();
         assert!(!buf.is_empty());
-        assert!(footer.root_position.offset < buf.len() as u64);
+        assert!(footer.root_index_block_position.offset < buf.len() as u64);
     }
 
     #[test]
     fn test_footer_encodes_root_offset_and_tree_height() {
         let footer = SstFooter {
-            root_position: Position {
+            root_index_block_position: Position {
                 offset: 0x0102_0304_0506_0708,
             },
             tree_height: 0x1112_1314,
@@ -266,7 +275,7 @@ mod tests {
 
         let footer_start = buf.len() - SstFooter::ENCODED_LEN;
         assert_eq!(footer_start % block_size, 0);
-        assert_eq!(footer.root_position.offset as usize % block_size, 0);
+        assert_eq!(footer.root_index_block_position.offset as usize % block_size, 0);
 
         let decoded = SstFooter::decode(&buf[footer_start..]).unwrap();
         assert_eq!(decoded, footer);
@@ -279,7 +288,7 @@ mod tests {
         let writer = sst_writer.into_inner();
         let buf = writer.into_inner();
         assert_eq!(buf.len(), SstFooter::ENCODED_LEN);
-        assert_eq!(footer.root_position, Position { offset: 0 });
+        assert_eq!(footer.root_index_block_position, Position { offset: 0 });
         assert_eq!(footer.tree_height, 0);
         assert_eq!(SstFooter::decode(&buf).unwrap(), footer);
     }
@@ -288,6 +297,6 @@ mod tests {
     fn test_build_empty() {
         let builder = fixed_builder(256);
         let (footer, _) = builder.finish().unwrap();
-        assert_eq!(footer.root_position, Position { offset: 0 });
+        assert_eq!(footer.root_index_block_position, Position { offset: 0 });
     }
 }

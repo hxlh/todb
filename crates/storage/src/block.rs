@@ -137,6 +137,36 @@ impl BlockReader for InMemoryBlockReader {
     }
 }
 
+/// File-based block reader for production.
+/// Reads fixed-size blocks via positional reads (`pread`) — thread-safe, no seek.
+pub struct FileBlockReader {
+    file: std::sync::Arc<std::fs::File>,
+    block_size: usize,
+}
+
+impl FileBlockReader {
+    pub fn open(path: &Path, block_size: usize) -> StorageResult<Self> {
+        let file = std::fs::File::open(path)?;
+        Ok(Self {
+            file: std::sync::Arc::new(file),
+            block_size,
+        })
+    }
+}
+
+impl BlockReader for FileBlockReader {
+    fn read_block(&self, position: &Position) -> StorageResult<Bytes> {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0u8; self.block_size];
+        self.file.read_exact_at(&mut buf, position.offset)?;
+        Ok(Bytes::from(buf))
+    }
+
+    fn block_size(&self) -> usize {
+        self.block_size
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

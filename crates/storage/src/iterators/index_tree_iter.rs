@@ -36,7 +36,7 @@ where
             reader,
             option: option.clone(),
             tree_height: footer.tree_height as usize,
-            root_position: footer.root_position,
+            root_position: footer.root_index_block_position,
             index_iters: Vec::new(),
             curr_iter_idx: 0,
         };
@@ -330,7 +330,7 @@ mod tests {
         let (bytes, footer, option) = build_sst(200, 256);
         let mut raw = bytes;
 
-        let root_offset = footer.root_position.offset as usize;
+        let root_offset = footer.root_index_block_position.offset as usize;
         let root_block_len = 256.min(raw.len() - root_offset);
         let root_block = &raw[root_offset..root_offset + root_block_len];
         let count = u32::from_be_bytes(root_block[0..4].try_into().unwrap()) as usize;
