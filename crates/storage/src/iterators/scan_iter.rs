@@ -1,6 +1,6 @@
 use crate::{
     errors::StorageResult,
-    iterators::storage_iter::{AsArray, StorageIter},
+    iterators::storage_iter::{AsArray, ForwardIter, ReverseIter, StorageIter},
     memtable::Entry,
 };
 
@@ -67,7 +67,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iterators::entry_decode_iter::EntryValue;
+    use crate::iterators::data_entry_decode_iter::EntryValue;
 
     /// A minimal StorageIter for testing: yields one entry.
     struct SingleEntry {
@@ -76,15 +76,12 @@ mod tests {
         valid: bool,
     }
 
-    impl StorageIter for SingleEntry {
+    impl ForwardIter for SingleEntry {
         type Key<'a> = crate::row_key::BinaryKey<'a>;
         type Value<'a> = EntryValue<'a>
         where
             Self: 'a;
 
-        fn valid(&self) -> bool {
-            self.valid
-        }
         fn seek_to_first(&mut self) -> StorageResult<()> {
             self.valid = true;
             Ok(())
@@ -96,6 +93,27 @@ mod tests {
         fn next(&mut self) -> StorageResult<()> {
             self.valid = false;
             Ok(())
+        }
+    }
+
+    impl ReverseIter for SingleEntry {
+        fn seek_to_last(&mut self) -> StorageResult<()> {
+            self.valid = true;
+            Ok(())
+        }
+        fn seek_for_prev<'a>(&mut self, target: &Self::Key<'a>) -> StorageResult<()> {
+            self.valid = self.key.as_slice() <= target.as_bytes();
+            Ok(())
+        }
+        fn prev(&mut self) -> StorageResult<()> {
+            self.valid = false;
+            Ok(())
+        }
+    }
+
+    impl StorageIter for SingleEntry {
+        fn valid(&self) -> bool {
+            self.valid
         }
         fn key(&self) -> Option<Self::Key<'_>> {
             if self.valid {

@@ -7,8 +7,8 @@ use crate::{
     builder::{SstBuilder, SstOption},
     iterators::{
         block_iter::NormalBlockIter,
-        entry_decode_iter::EntryDecodeIter,
-        storage_iter::{AsArray, StorageIter},
+        data_entry_decode_iter::DataEntryDecodeIter,
+        storage_iter::{AsArray, ForwardIter, StorageIter},
         sst_iter::SstIter,
     },
     row_key::RowKey,
@@ -20,10 +20,10 @@ use super::helpers::{build_sst, make_key, make_value};
 fn make_iter(
     n: u64,
     block_size: usize,
-) -> SstIter<InMemoryBlockReader, NormalBlockIter, EntryDecodeIter<NormalBlockIter>> {
+) -> SstIter<InMemoryBlockReader, NormalBlockIter, DataEntryDecodeIter<NormalBlockIter>> {
     let (bytes, footer, option) = build_sst(n, block_size);
     let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(bytes), block_size));
-    SstIter::<_, NormalBlockIter, EntryDecodeIter<NormalBlockIter>>::new(reader, footer, option)
+    SstIter::<_, NormalBlockIter, DataEntryDecodeIter<NormalBlockIter>>::new(reader, footer, option)
         .unwrap()
 }
 

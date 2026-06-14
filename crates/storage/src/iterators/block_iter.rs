@@ -6,9 +6,10 @@ use tracing::debug;
 
 use crate::{
     errors::StorageResult,
-    iterators::storage_iter::{AsArray, DataBlockIter, IndexBlockIter, StorageIter},
+    iterators::storage_iter::{AsArray, DataBlockIter, ForwardIter, IndexBlockIter, ReverseIter, StorageIter},
     row_key::{BinaryKey, RowKey},
 };
+
 
 pub struct RawEntry<'a> {
     buf: &'a [u8],
@@ -32,7 +33,8 @@ pub struct NormalBlockIter {
     key_offsets: Vec<usize>,
     values_offsets: Vec<usize>,
     count: usize,
-    curr_idx: usize,
+    /// `None` means the iterator is invalid (exhausted or not positioned).
+    curr: Option<usize>,
 }
 
 impl NormalBlockIter {
@@ -41,7 +43,7 @@ impl NormalBlockIter {
             block,
             key_offsets: vec![],
             values_offsets: vec![],
-            curr_idx: 0,
+            curr: None,
             count: 0,
         };
 
@@ -80,63 +82,90 @@ impl NormalBlockIter {
 
     fn reset(&mut self) {
         // clean
-        self.curr_idx = 0;
+        self.curr = None;
         self.key_offsets.clear();
         self.values_offsets.clear();
     }
 }
-
-impl StorageIter for NormalBlockIter {
+impl ForwardIter for NormalBlockIter {
     type Key<'a> = RowKey<'a>;
-
     type Value<'a> = RawEntry<'a>;
 
-    fn valid(&self) -> bool {
-        self.count > 0 && self.curr_idx < self.count
-    }
-
     fn seek_to_first(&mut self) -> StorageResult<()> {
+        self.curr = (self.count > 0).then_some(0);
         Ok(())
     }
 
-    fn seek<'a>(&mut self, target: &Self::Key<'a>) -> StorageResult<()> {
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
         // Binary search for the first key >= target (lower_bound).
-        // Upper bound excludes the sentinel slot.
         let mut lo = 0usize;
         let mut hi = self.count;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            self.curr_idx = mid;
+            self.curr = Some(mid);
             match self.key() {
                 Some(k) if k < *target => lo = mid + 1,
                 _ => hi = mid,
             }
         }
-        self.curr_idx = lo;
+        self.curr = (lo < self.count).then_some(lo);
         Ok(())
     }
 
     fn next(&mut self) -> StorageResult<()> {
-        self.curr_idx += 1;
+        if let Some(i) = self.curr {
+            self.curr = (i + 1 < self.count).then_some(i + 1);
+        }
+        Ok(())
+    }
+}
+impl ReverseIter for NormalBlockIter {
+    fn seek_to_last(&mut self) -> StorageResult<()> {
+        self.curr = (self.count > 0).then_some(self.count - 1);
         Ok(())
     }
 
-    fn key(&self) -> Option<Self::Key<'_>> {
-        if self.valid() {
-            let start = self.key_offsets[self.curr_idx];
-            let end = self.key_offsets[self.curr_idx + 1]; // sentinel always present
-            return Some(BinaryKey::from(&self.block[start..end]));
+    fn seek_for_prev(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+        // Binary search for upper_bound (first key > target), then subtract 1.
+        let mut lo = 0usize;
+        let mut hi = self.count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            self.curr = Some(mid);
+            match self.key() {
+                Some(k) if k <= *target => lo = mid + 1,
+                _ => hi = mid,
+            }
         }
-        None
+        // lo = first index where key > target (or count if all keys <= target).
+        // Position at lo - 1 (the last key <= target), or None if lo == 0.
+        self.curr = lo.checked_sub(1);
+        Ok(())
+    }
+
+    fn prev(&mut self) -> StorageResult<()> {
+        self.curr = self.curr.and_then(|i| i.checked_sub(1));
+        Ok(())
+    }
+}
+
+impl StorageIter for NormalBlockIter {
+    fn valid(&self) -> bool {
+        self.curr.is_some()
+    }
+
+    fn key(&self) -> Option<Self::Key<'_>> {
+        let i = self.curr?;
+        let start = self.key_offsets[i];
+        let end = self.key_offsets[i + 1]; // sentinel always present
+        Some(RowKey::from(&self.block[start..end]))
     }
 
     fn value(&self) -> Option<Self::Value<'_>> {
-        if self.valid() {
-            let start = self.values_offsets[self.curr_idx];
-            let end = self.values_offsets[self.curr_idx + 1]; // sentinel always present
-            return Some(RawEntry::from(&self.block[start..end]));
-        }
-        None
+        let i = self.curr?;
+        let start = self.values_offsets[i];
+        let end = self.values_offsets[i + 1]; // sentinel always present
+        Some(RawEntry::from(&self.block[start..end]))
     }
 }
 
@@ -148,12 +177,12 @@ BlockIter
     count: {},
     key_offsets: {:?},
     values_offsets: {:?},
-    curr_idx: {}
+    curr: {:?}
 "#,
             self.key_offsets.len(),
             self.key_offsets,
             self.values_offsets,
-            self.curr_idx
+            self.curr
         ));
         Ok(())
     }
@@ -178,7 +207,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::{
-        iterators::storage_iter::{AsArray, StorageIter},
+        iterators::storage_iter::{AsArray, ForwardIter, StorageIter},
         row_key::BinaryKey,
     };
 

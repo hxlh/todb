@@ -2,17 +2,18 @@ use bytes::Bytes;
 
 use crate::{
     errors::{StorageError, StorageResult},
-    iterators::storage_iter::{AsArray, DataBlockIter, StorageIter},
+    iterators::storage_iter::{AsArray, DataBlockIter, ForwardIter, ReverseIter, StorageIter},
 };
 
 const DATA_ENTRY_VERSION: u8 = 1;
 
-pub struct EntryDecodeIter<I> {
+/// 解码Value到具体语义(Put/Delete)
+pub struct DataEntryDecodeIter<I> {
     input: I,
     entry_header: Option<EntryHeader>,
 }
 
-impl<I> EntryDecodeIter<I> {
+impl<I> DataEntryDecodeIter<I> {
     pub fn new(input: I) -> Self {
         Self {
             input,
@@ -49,7 +50,7 @@ impl<I> EntryDecodeIter<I> {
     }
 }
 
-impl<I> EntryDecodeIter<I>
+impl<I> DataEntryDecodeIter<I>
 where
     I: StorageIter,
     for<'a> I::Value<'a>: AsArray<'a>,
@@ -68,7 +69,7 @@ where
     }
 }
 
-impl<I> StorageIter for EntryDecodeIter<I>
+impl<I> ForwardIter for DataEntryDecodeIter<I>
 where
     I: StorageIter,
     for<'a> I::Value<'a>: AsArray<'a>,
@@ -79,10 +80,6 @@ where
         = EntryValue<'a>
     where
         Self: 'a;
-
-    fn valid(&self) -> bool {
-        self.input.valid()
-    }
 
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.input.seek_to_first()?;
@@ -97,6 +94,37 @@ where
     fn next(&mut self) -> StorageResult<()> {
         self.input.next()?;
         self.refresh_current()
+    }
+}
+
+impl<I> ReverseIter for DataEntryDecodeIter<I>
+where
+    I: StorageIter,
+    for<'a> I::Value<'a>: AsArray<'a>,
+{
+    fn seek_to_last(&mut self) -> StorageResult<()> {
+        self.input.seek_to_last()?;
+        self.refresh_current()
+    }
+
+    fn seek_for_prev(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+        self.input.seek_for_prev(target)?;
+        self.refresh_current()
+    }
+
+    fn prev(&mut self) -> StorageResult<()> {
+        self.input.prev()?;
+        self.refresh_current()
+    }
+}
+
+impl<I> StorageIter for DataEntryDecodeIter<I>
+where
+    I: StorageIter,
+    for<'a> I::Value<'a>: AsArray<'a>,
+{
+    fn valid(&self) -> bool {
+        self.input.valid()
     }
 
     fn key(&self) -> Option<Self::Key<'_>> {
@@ -118,7 +146,7 @@ where
     }
 }
 
-impl<I> DataBlockIter for EntryDecodeIter<I>
+impl<I> DataBlockIter for DataEntryDecodeIter<I>
 where
     I: DataBlockIter,
     for<'a> I::Value<'a>: AsArray<'a>,
@@ -183,16 +211,12 @@ mod tests {
         }
     }
 
-    impl StorageIter for VecEntryIter {
+    impl ForwardIter for VecEntryIter {
         type Key<'a> = &'a [u8];
         type Value<'a>
             = RawEntry<'a>
         where
             Self: 'a;
-
-        fn valid(&self) -> bool {
-            self.pos < self.entries.len()
-        }
 
         fn seek_to_first(&mut self) -> StorageResult<()> {
             self.pos = if self.entries.is_empty() {
@@ -217,6 +241,42 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    impl ReverseIter for VecEntryIter {
+        fn seek_to_last(&mut self) -> StorageResult<()> {
+            self.pos = if self.entries.is_empty() {
+                usize::MAX
+            } else {
+                self.entries.len() - 1
+            };
+            Ok(())
+        }
+
+        fn seek_for_prev(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+            let upper = self.entries.partition_point(|(key, _)| key <= target);
+            self.pos = if upper == 0 {
+                usize::MAX
+            } else {
+                upper - 1
+            };
+            Ok(())
+        }
+
+        fn prev(&mut self) -> StorageResult<()> {
+            if self.pos == 0 {
+                self.pos = usize::MAX;
+            } else if self.pos < self.entries.len() {
+                self.pos -= 1;
+            }
+            Ok(())
+        }
+    }
+
+    impl StorageIter for VecEntryIter {
+        fn valid(&self) -> bool {
+            self.pos < self.entries.len()
+        }
 
         fn key(&self) -> Option<Self::Key<'_>> {
             self.valid().then_some(self.entries[self.pos].0)
@@ -238,7 +298,7 @@ mod tests {
     fn seek_to_first_decodes_current_entry_payload() {
         let first = put(b"v1");
         let input = VecEntryIter::new(vec![(b"k1", Box::leak(first.into_boxed_slice()))]);
-        let mut iter = EntryDecodeIter::new(input);
+        let mut iter = DataEntryDecodeIter::new(input);
 
         iter.seek_to_first().unwrap();
 
@@ -255,7 +315,7 @@ mod tests {
             (b"k1", Box::leak(first.into_boxed_slice())),
             (b"k2", Box::leak(second.into_boxed_slice())),
         ]);
-        let mut iter = EntryDecodeIter::new(input);
+        let mut iter = DataEntryDecodeIter::new(input);
 
         iter.seek(&&b"k2"[..]).unwrap();
 
@@ -272,7 +332,7 @@ mod tests {
             (b"k1", Box::leak(first.into_boxed_slice())),
             (b"k2", Box::leak(second.into_boxed_slice())),
         ]);
-        let mut iter = EntryDecodeIter::new(input);
+        let mut iter = DataEntryDecodeIter::new(input);
 
         iter.seek_to_first().unwrap();
         iter.next().unwrap();
@@ -285,7 +345,7 @@ mod tests {
     #[test]
     fn delete_entry_decodes_to_delete_variant() {
         let input = VecEntryIter::new(vec![(b"k1", b"\x01\x01")]);
-        let mut iter = EntryDecodeIter::new(input);
+        let mut iter = DataEntryDecodeIter::new(input);
 
         iter.seek_to_first().unwrap();
 
@@ -296,7 +356,7 @@ mod tests {
     #[test]
     fn unknown_data_entry_version_returns_error() {
         let input = VecEntryIter::new(vec![(b"k1", b"\x02\x00abc")]);
-        let mut iter = EntryDecodeIter::new(input);
+        let mut iter = DataEntryDecodeIter::new(input);
 
         assert!(iter.seek_to_first().is_err());
     }
@@ -304,7 +364,7 @@ mod tests {
     #[test]
     fn invalid_entry_kind_returns_error_when_positioning() {
         let input = VecEntryIter::new(vec![(b"k1", b"\x01\x02bad")]);
-        let mut iter = EntryDecodeIter::new(input);
+        let mut iter = DataEntryDecodeIter::new(input);
 
         assert!(iter.seek_to_first().is_err());
     }

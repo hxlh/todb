@@ -1,4 +1,4 @@
-use crate::{errors::StorageResult, iterators::storage_iter::StorageIter};
+use crate::{errors::StorageResult, iterators::storage_iter::{ForwardIter, ReverseIter, StorageIter}};
 
 /// Extension of [`StorageIter`] that defines how an iterator's native
 /// key/value types are exposed to merge layers.
@@ -31,6 +31,7 @@ pub trait MappedStorageIter: StorageIter + 'static {
     fn map_key<'a>(key: Self::Key<'a>) -> Self::MappedKey<'a>;
     fn map_value<'a>(value: Self::Value<'a>) -> Self::MappedValue<'a>;
     fn seek_mapped(&mut self, target: &Self::MappedKey<'_>) -> StorageResult<()>;
+    fn seek_mapped_for_prev(&mut self, target: &Self::MappedKey<'_>) -> StorageResult<()>;
 }
 
 /// Adapter iterator that exposes an inner iterator through its
@@ -48,15 +49,11 @@ impl<I: MappedStorageIter> MapIter<I> {
     }
 }
 
-impl<I: MappedStorageIter> StorageIter for MapIter<I> {
+impl<I: MappedStorageIter> ForwardIter for MapIter<I> {
     type Key<'a> = I::MappedKey<'a>;
     type Value<'a> = I::MappedValue<'a>
     where
         Self: 'a;
-
-    fn valid(&self) -> bool {
-        self.inner.valid()
-    }
 
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.inner.seek_to_first()
@@ -68,6 +65,26 @@ impl<I: MappedStorageIter> StorageIter for MapIter<I> {
 
     fn next(&mut self) -> StorageResult<()> {
         self.inner.next()
+    }
+}
+
+impl<I: MappedStorageIter> ReverseIter for MapIter<I> {
+    fn seek_to_last(&mut self) -> StorageResult<()> {
+        self.inner.seek_to_last()
+    }
+
+    fn seek_for_prev(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+        self.inner.seek_mapped_for_prev(target)
+    }
+
+    fn prev(&mut self) -> StorageResult<()> {
+        self.inner.prev()
+    }
+}
+
+impl<I: MappedStorageIter> StorageIter for MapIter<I> {
+    fn valid(&self) -> bool {
+        self.inner.valid()
     }
 
     fn key(&self) -> Option<Self::Key<'_>> {

@@ -1,4 +1,4 @@
-use crate::{errors::StorageResult, iterators::storage_iter::StorageIter};
+use crate::{errors::StorageResult, iterators::storage_iter::{ForwardIter, ReverseIter, StorageIter}};
 
 // Concatenates multiple ordered, non-overlapping SST iterators into a single
 // sequential iterator. SSTs must be provided in ascending key order.
@@ -13,20 +13,13 @@ impl<I: StorageIter> ConcatIter<I> {
     }
 }
 
-impl<I: StorageIter> StorageIter for ConcatIter<I> {
+impl<I: StorageIter> ForwardIter for ConcatIter<I> {
     type Key<'a> = I::Key<'a>;
 
     type Value<'a>
         = I::Value<'a>
     where
         Self: 'a;
-
-    fn valid(&self) -> bool {
-        if !self.iter.is_empty() && self.curr < self.iter.len() {
-            return self.iter[self.curr].valid();
-        }
-        false
-    }
 
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.curr = 0;
@@ -75,6 +68,69 @@ impl<I: StorageIter> StorageIter for ConcatIter<I> {
             self.curr += 1; // skip empty SST
         }
         Ok(())
+    }
+}
+
+impl<I: StorageIter> ReverseIter for ConcatIter<I> {
+    fn seek_to_last(&mut self) -> StorageResult<()> {
+        if self.iter.is_empty() {
+            return Ok(());
+        }
+        self.curr = self.iter.len() - 1;
+        loop {
+            self.iter[self.curr].seek_to_last()?;
+            if self.iter[self.curr].valid() {
+                break;
+            }
+            if self.curr == 0 {
+                break;
+            }
+            self.curr -= 1;
+        }
+        Ok(())
+    }
+
+    fn seek_for_prev<'a>(&mut self, target: &Self::Key<'a>) -> StorageResult<()> {
+        for i in (0..self.iter.len()).rev() {
+            self.iter[i].seek_for_prev(target)?;
+            if self.iter[i].valid() {
+                self.curr = i;
+                return Ok(());
+            }
+        }
+        self.curr = 0;
+        Ok(())
+    }
+
+    fn prev(&mut self) -> StorageResult<()> {
+        if !self.valid() {
+            return Ok(());
+        }
+        self.iter[self.curr].prev()?;
+        if self.iter[self.curr].valid() {
+            return Ok(());
+        }
+        // Current SST exhausted in reverse — move to previous one.
+        if self.curr > 0 {
+            self.curr -= 1;
+            loop {
+                self.iter[self.curr].seek_to_last()?;
+                if self.iter[self.curr].valid() || self.curr == 0 {
+                    break;
+                }
+                self.curr -= 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<I: StorageIter> StorageIter for ConcatIter<I> {
+    fn valid(&self) -> bool {
+        if !self.iter.is_empty() && self.curr < self.iter.len() {
+            return self.iter[self.curr].valid();
+        }
+        false
     }
 
     fn key(&self) -> Option<Self::Key<'_>> {

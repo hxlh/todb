@@ -17,7 +17,7 @@ const DATA_ENTRY_HEADER_LEN: usize = 2;
 // Each entry contributes one key offset and one value offset (u32 + u32).
 const PER_ENTRY_OFFSET_TABLE_BYTES: usize = 8;
 
-// Entry kind byte values — must match [`crate::iterators::entry_decode_iter`].
+// Entry kind byte values — must match [`crate::iterators::data_entry_decode_iter`].
 const KIND_PUT: u8 = 0;
 const KIND_DELETE: u8 = 1;
 

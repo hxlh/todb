@@ -16,7 +16,7 @@ use crate::{
         merge_iter::MergeIter,
         scan_iter::ScanIter,
         sst_iter::SstIter,
-        storage_iter::{AsArray, StorageIter},
+        storage_iter::{AsArray, ForwardIter, StorageIter},
         two_merge_iter::TwoMergeIter,
     },
     lsm_state::{LsmOption, LsmState},

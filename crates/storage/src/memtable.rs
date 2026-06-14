@@ -12,7 +12,7 @@ use ouroboros::self_referencing;
 
 use crate::{
     errors::StorageResult,
-    iterators::{entry_decode_iter::EntryValue, storage_iter::StorageIter, map_iter::MappedStorageIter},
+    iterators::{data_entry_decode_iter::EntryValue, storage_iter::{ForwardIter, ReverseIter, StorageIter}, map_iter::MappedStorageIter},
     row_key::RowKey,
 };
 
@@ -122,7 +122,7 @@ where
     }
 }
 
-impl<'m, K, V> StorageIter for MemTableIter<'m, K, V>
+impl<'m, K, V> ForwardIter for MemTableIter<'m, K, V>
 where
     K: Ord + Send + 'static,
     V: Send + 'static,
@@ -132,10 +132,6 @@ where
         = &'v Entry<V>
     where
         Self: 'v;
-
-    fn valid(&self) -> bool {
-        self.current.is_some()
-    }
 
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.current = self.map.iter().next();
@@ -152,6 +148,39 @@ where
             self.current = v.next();
         }
         Ok(())
+    }
+}
+
+impl<'m, K, V> ReverseIter for MemTableIter<'m, K, V>
+where
+    K: Ord + Send + 'static,
+    V: Send + 'static,
+{
+    fn seek_to_last(&mut self) -> StorageResult<()> {
+        self.current = self.map.back();
+        Ok(())
+    }
+
+    fn seek_for_prev(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+        self.current = self.map.upper_bound(Bound::Included(target));
+        Ok(())
+    }
+
+    fn prev(&mut self) -> StorageResult<()> {
+        if let Some(v) = &self.current {
+            self.current = v.prev();
+        }
+        Ok(())
+    }
+}
+
+impl<'m, K, V> StorageIter for MemTableIter<'m, K, V>
+where
+    K: Ord + Send + 'static,
+    V: Send + 'static,
+{
+    fn valid(&self) -> bool {
+        self.current.is_some()
     }
 
     fn key(&self) -> Option<Self::Key<'_>> {
@@ -180,7 +209,7 @@ where
     item: Option<(K, Entry<V>)>,
 }
 
-impl<K, V> StorageIter for OwnedMemTableIter<K, V>
+impl<K, V> ForwardIter for OwnedMemTableIter<K, V>
 where
     K: Ord + Clone + Send + 'static,
     V: Clone + Send + 'static,
@@ -190,10 +219,6 @@ where
         = &'a Entry<V>
     where
         Self: 'a;
-
-    fn valid(&self) -> bool {
-        self.borrow_item().is_some()
-    }
 
     fn seek_to_first(&mut self) -> StorageResult<()> {
         let map = self.with_map(|m| m.clone());
@@ -242,6 +267,70 @@ where
         self.with_mut(|fields| *fields.item = kv);
         Ok(())
     }
+}
+
+impl<K, V> ReverseIter for OwnedMemTableIter<K, V>
+where
+    K: Ord + Clone + Send + 'static,
+    V: Clone + Send + 'static,
+{
+    fn seek_to_last(&mut self) -> StorageResult<()> {
+        let map = self.with_map(|m| m.clone());
+        let mut new = OwnedMemTableIterBuilder {
+            map,
+            current_builder: |map| map.back(),
+            item: None,
+        }
+        .build();
+        let kv = new.with_current(|current| {
+            current
+                .as_ref()
+                .map(|e| (e.key().clone(), e.value().clone()))
+        });
+        new.with_mut(|fields| *fields.item = kv);
+        *self = new;
+        Ok(())
+    }
+
+    fn seek_for_prev(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+        let map = self.with_map(|m| m.clone());
+        let target = (*target).clone();
+        let mut new = OwnedMemTableIterBuilder {
+            map,
+            current_builder: |map| map.upper_bound(Bound::Included(&target)),
+            item: None,
+        }
+        .build();
+        let kv = new.with_current(|current| {
+            current
+                .as_ref()
+                .map(|e| (e.key().clone(), e.value().clone()))
+        });
+        new.with_mut(|fields| *fields.item = kv);
+        *self = new;
+        Ok(())
+    }
+
+    fn prev(&mut self) -> StorageResult<()> {
+        let kv = self.with_current_mut(|current| {
+            *current = current.as_ref().and_then(|e| e.prev());
+            current
+                .as_ref()
+                .map(|e| (e.key().clone(), e.value().clone()))
+        });
+        self.with_mut(|fields| *fields.item = kv);
+        Ok(())
+    }
+}
+
+impl<K, V> StorageIter for OwnedMemTableIter<K, V>
+where
+    K: Ord + Clone + Send + 'static,
+    V: Clone + Send + 'static,
+{
+    fn valid(&self) -> bool {
+        self.borrow_item().is_some()
+    }
 
     fn key(&self) -> Option<Self::Key<'_>> {
         self.borrow_item().as_ref().map(|(k, _)| k)
@@ -283,6 +372,11 @@ impl MappedStorageIter for OwnedMemTableIter<Bytes, Bytes> {
         self.seek_by_bytes(target.as_bytes());
         Ok(())
     }
+
+    fn seek_mapped_for_prev(&mut self, target: &RowKey<'_>) -> StorageResult<()> {
+        let key = Bytes::copy_from_slice(target.as_bytes());
+        self.seek_for_prev(&&key)
+    }
 }
 
 #[cfg(test)]
@@ -290,7 +384,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::iterators::storage_iter::StorageIter;
+    use crate::iterators::storage_iter::{ForwardIter, StorageIter};
 
     fn k(s: &str) -> Bytes {
         Bytes::from(s.to_string())

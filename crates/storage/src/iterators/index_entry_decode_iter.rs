@@ -1,7 +1,7 @@
 use crate::{
     block::Position,
     errors::{StorageError, StorageResult},
-    iterators::storage_iter::{AsArray, StorageIter},
+    iterators::storage_iter::{AsArray, ForwardIter, ReverseIter, StorageIter},
 };
 
 const INDEX_VALUE_VERSION: u8 = 1;
@@ -67,20 +67,17 @@ where
     }
 }
 
-impl<I> StorageIter for IndexEntryDecodeIter<I>
+impl<I> ForwardIter for IndexEntryDecodeIter<I>
 where
     I: StorageIter,
     for<'a> I::Value<'a>: AsArray<'a>,
 {
     type Key<'a> = I::Key<'a>;
+
     type Value<'a>
         = IndexEntryValue<'a>
     where
         Self: 'a;
-
-    fn valid(&self) -> bool {
-        self.input.valid()
-    }
 
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.input.seek_to_first()?;
@@ -95,6 +92,37 @@ where
     fn next(&mut self) -> StorageResult<()> {
         self.input.next()?;
         self.refresh_current()
+    }
+}
+
+impl<I> ReverseIter for IndexEntryDecodeIter<I>
+where
+    I: StorageIter,
+    for<'a> I::Value<'a>: AsArray<'a>,
+{
+    fn seek_to_last(&mut self) -> StorageResult<()> {
+        self.input.seek_to_last()?;
+        self.refresh_current()
+    }
+
+    fn seek_for_prev(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+        self.input.seek_for_prev(target)?;
+        self.refresh_current()
+    }
+
+    fn prev(&mut self) -> StorageResult<()> {
+        self.input.prev()?;
+        self.refresh_current()
+    }
+}
+
+impl<I> StorageIter for IndexEntryDecodeIter<I>
+where
+    I: StorageIter,
+    for<'a> I::Value<'a>: AsArray<'a>,
+{
+    fn valid(&self) -> bool {
+        self.input.valid()
     }
 
     fn key(&self) -> Option<Self::Key<'_>> {
@@ -163,16 +191,12 @@ mod tests {
         }
     }
 
-    impl StorageIter for VecEntryIter {
+    impl ForwardIter for VecEntryIter {
         type Key<'a> = &'a [u8];
         type Value<'a>
             = RawEntry<'a>
         where
             Self: 'a;
-
-        fn valid(&self) -> bool {
-            self.pos < self.entries.len()
-        }
 
         fn seek_to_first(&mut self) -> crate::errors::StorageResult<()> {
             self.pos = if self.entries.is_empty() {
@@ -199,6 +223,42 @@ mod tests {
                 }
             }
             Ok(())
+        }
+    }
+
+    impl ReverseIter for VecEntryIter {
+        fn seek_to_last(&mut self) -> crate::errors::StorageResult<()> {
+            self.pos = if self.entries.is_empty() {
+                usize::MAX
+            } else {
+                self.entries.len() - 1
+            };
+            Ok(())
+        }
+
+        fn seek_for_prev(&mut self, target: &Self::Key<'_>) -> crate::errors::StorageResult<()> {
+            let upper = self.entries.partition_point(|(key, _)| key <= target);
+            self.pos = if upper == 0 {
+                usize::MAX
+            } else {
+                upper - 1
+            };
+            Ok(())
+        }
+
+        fn prev(&mut self) -> crate::errors::StorageResult<()> {
+            if self.pos == 0 {
+                self.pos = usize::MAX;
+            } else if self.pos < self.entries.len() {
+                self.pos -= 1;
+            }
+            Ok(())
+        }
+    }
+
+    impl StorageIter for VecEntryIter {
+        fn valid(&self) -> bool {
+            self.pos < self.entries.len()
         }
 
         fn key(&self) -> Option<Self::Key<'_>> {

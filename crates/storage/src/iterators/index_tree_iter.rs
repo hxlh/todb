@@ -7,7 +7,7 @@ use crate::{
     iterators::{
         block_iter::NormalBlockIter,
         index_entry_decode_iter::IndexEntryDecodeIter,
-        storage_iter::{AsArray, IndexBlockIter, StorageIter},
+        storage_iter::{AsArray, ForwardIter, IndexBlockIter, ReverseIter, StorageIter},
     },
 };
 
@@ -164,9 +164,121 @@ where
         }
         Ok(())
     }
+
+    fn inner_seek_for_prev<'a>(&mut self, target: Option<&I::Key<'a>>) -> StorageResult<()> {
+        if self.tree_height <= 1 {
+            // no index block
+            return Ok(());
+        }
+        self.reset();
+
+        let root_block = self.reader.read_block(&self.root_position)?;
+        let mut root_iter = IndexEntryDecodeIter::new(I::from_block(root_block)?);
+        if let Some(target) = target {
+            root_iter.seek_for_prev(target)?;
+        } else {
+            root_iter.seek_to_last()?;
+        }
+        self.index_iters.push(root_iter);
+
+        while self.curr_iter_idx < self.last_index_level() {
+            let layer_span = span!(
+                tracing::Level::DEBUG,
+                "inner_seek_for_prev",
+                level = self.curr_iter_idx,
+                stack_size = self.index_iters.len(),
+                is_last = self.curr_iter_idx == self.last_index_level()
+            );
+            let _enter = layer_span.enter();
+
+            let curr_iter = &mut self.index_iters[self.curr_iter_idx];
+            if !curr_iter.valid() {
+                self.index_iters.remove(self.curr_iter_idx);
+                if self.curr_iter_idx == 0 {
+                    break;
+                }
+                self.curr_iter_idx -= 1;
+                continue;
+            }
+
+            let next_level_position: Position = curr_iter
+                .value()
+                .ok_or_else(|| StorageError::InvalidValue("iter values not exists".into()))?
+                .into();
+
+            // create child iter
+            let block = self.reader.read_block(&next_level_position)?;
+            let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
+            if let Some(target) = target {
+                child_iter.seek_for_prev(target)?;
+            } else {
+                child_iter.seek_to_last()?;
+            }
+            debug!(
+                "create level {} curr_iters_size: {}",
+                self.curr_iter_idx + 1,
+                self.index_iters.len() + 1
+            );
+            self.index_iters.push(child_iter);
+
+            // scan next level
+            self.curr_iter_idx += 1;
+        }
+
+        Ok(())
+    }
+
+    fn inner_prev(&mut self) -> StorageResult<()> {
+        let last_index_level = self.last_index_level();
+
+        while self.curr_iter_idx <= last_index_level {
+            let curr_iter = &mut self.index_iters[self.curr_iter_idx];
+            curr_iter.prev()?;
+            if !curr_iter.valid() {
+                // return to parent level
+                self.index_iters.remove(self.curr_iter_idx);
+                // if curr is root,no next item
+                if self.curr_iter_idx == 0 {
+                    break;
+                }
+                self.curr_iter_idx -= 1;
+                continue;
+            }
+
+            // 如果是最后一层，直接成功
+            if self.curr_iter_idx == last_index_level {
+                break;
+            }
+
+            // if not leaf, move to next child iter
+            let next_level_position: Position = curr_iter
+                .value()
+                .ok_or_else(|| StorageError::InvalidValue("iter values not exists".into()))?
+                .into();
+
+            // create child iter
+            let block = self.reader.read_block(&next_level_position)?;
+            let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
+            child_iter.seek_to_last()?;
+            debug!(
+                "create level {} curr_iters_size: {}",
+                self.curr_iter_idx + 1,
+                self.index_iters.len() + 1
+            );
+            self.index_iters.push(child_iter);
+
+            self.curr_iter_idx += 1;
+
+            // 直接退出，防止最后一层再次出发prev
+            if self.curr_iter_idx == last_index_level {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
-impl<R, I> StorageIter for IndexTreeIter<R, I>
+impl<R, I> ForwardIter for IndexTreeIter<R, I>
 where
     R: BlockReader,
     I: IndexBlockIter,
@@ -178,16 +290,6 @@ where
     where
         Self: 'a;
 
-    fn valid(&self) -> bool {
-        if !self.index_iters.is_empty()
-            && self.curr_iter_idx < self.index_iters.len()
-            && self.index_iters[self.curr_iter_idx].valid()
-        {
-            return true;
-        }
-        false
-    }
-
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.inner_seek(None)
     }
@@ -198,6 +300,49 @@ where
 
     fn next(&mut self) -> StorageResult<()> {
         self.inner_next()
+    }
+}
+
+impl<R, I> ReverseIter for IndexTreeIter<R, I>
+where
+    R: BlockReader,
+    I: IndexBlockIter,
+    for<'a> I::Value<'a>: AsArray<'a>,
+{
+    fn seek_to_last(&mut self) -> StorageResult<()> {
+        self.inner_seek_for_prev(None)
+    }
+
+    fn seek_for_prev<'a>(&mut self, target: &Self::Key<'a>) -> StorageResult<()> {
+        // End-key convention: navigate the tree with forward seek to find the
+        // block that *contains* target (first end_key >= target). If target
+        // exceeds all end_keys, fall back to the last entry (seek_to_last).
+        self.inner_seek(Some(target))?;
+        if !self.valid() {
+            self.inner_seek_for_prev(None)?;
+        }
+        Ok(())
+    }
+
+    fn prev(&mut self) -> StorageResult<()> {
+        self.inner_prev()
+    }
+}
+
+impl<R, I> StorageIter for IndexTreeIter<R, I>
+where
+    R: BlockReader,
+    I: IndexBlockIter,
+    for<'a> I::Value<'a>: AsArray<'a>,
+{
+    fn valid(&self) -> bool {
+        if !self.index_iters.is_empty()
+            && self.curr_iter_idx < self.index_iters.len()
+            && self.index_iters[self.curr_iter_idx].valid()
+        {
+            return true;
+        }
+        false
     }
 
     fn key(&self) -> Option<Self::Key<'_>> {
@@ -228,7 +373,7 @@ mod tests {
     use crate::{
         block::{BlockReader, InMemoryBlockReader, InMemoryBlockWriter},
         builder::{DefaultSstWriter, SstBuilder, SstFooter, SstOption},
-        iterators::storage_iter::StorageIter,
+        iterators::storage_iter::{ForwardIter, StorageIter},
     };
 
     fn make_key(i: u64) -> Bytes {
