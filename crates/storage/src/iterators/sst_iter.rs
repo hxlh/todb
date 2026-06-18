@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
 use crate::{
-    block::{Position, BlockReader},
+    block::{BlockReader, Position},
     builder::{SstFooter, SstOption},
     errors::{StorageError, StorageResult},
     iterators::{
         block_iter::NormalBlockIter,
         data_entry_decode_iter::DataEntryDecodeIter,
         index_tree_iter::IndexTreeIter,
-        storage_iter::{AsArray, DataBlockIter, ForwardIter, IndexBlockIter, ReverseIter, StorageIter},
+        storage_iter::{
+            AsArray, DataBlockIter, ForwardIter, IndexBlockIter, IterBase, IterRead, ReverseIter,
+        },
     },
 };
 
@@ -16,9 +18,7 @@ pub struct SstIter<R, I = NormalBlockIter, D = DataEntryDecodeIter<NormalBlockIt
 where
     R: BlockReader,
     I: IndexBlockIter,
-    for<'a> I::Value<'a>: AsArray<'a>,
     D: DataBlockIter,
-    for<'a> D::Value<'a>: AsArray<'a>,
 {
     reader: Arc<R>,
     #[allow(dead_code)]
@@ -33,7 +33,6 @@ where
     I: IndexBlockIter,
     for<'a> I::Value<'a>: AsArray<'a>,
     D: DataBlockIter,
-    for<'a> D::Value<'a>: AsArray<'a>,
 {
     pub fn new(reader: Arc<R>, footer: SstFooter, option: SstOption) -> StorageResult<Self> {
         Ok(Self {
@@ -49,15 +48,12 @@ impl<R, I, D> SstIter<R, I, D>
 where
     R: BlockReader,
     I: IndexBlockIter,
-    for<'a> I::Value<'a>: AsArray<'a>,
     D: DataBlockIter,
-    for<'a> D::Value<'a>: AsArray<'a>,
-    for<'a> I: StorageIter<Key<'a> = D::Key<'a>>,
+    for<'a> I::Value<'a>: AsArray<'a>
 {
-    /// Load and decode the data block at the index iterator's current
-    /// position. The caller is responsible for positioning the returned
-    /// iterator (seek_to_first / seek / seek_to_last / seek_for_prev).
-    fn load_data_block(&mut self) -> StorageResult<D> {
+    /// Load and decode the data block at the given block position.
+    /// Callers obtain the Position from `value()` on the index iterator.
+    fn load_data_block_from_index(&mut self) -> StorageResult<D> {
         let pos: Position = self.index_iter.value().ok_or_else(|| {
             StorageError::InvalidValue("index iter valid but value is none".into())
         })?;
@@ -66,33 +62,57 @@ where
     }
 }
 
-impl<R, I, D> ForwardIter for SstIter<R, I, D>
+impl<R, I, D> IterBase for SstIter<R, I, D>
 where
     R: BlockReader,
     I: IndexBlockIter,
-    for<'a> I::Value<'a>: AsArray<'a>,
     D: DataBlockIter,
-    for<'a> D::Value<'a>: AsArray<'a>,
-    // Index and data block must share the same key type so seek targets are compatible.
-    // Key<'a> has no `where Self: 'a`, so for<'a> does not require I: 'static or D: 'static.
-    for<'a> I: StorageIter<Key<'a> = D::Key<'a>>,
 {
     type Key<'a> = D::Key<'a>;
-    type Value<'a> = D::Value<'a> where Self: 'a;
+    type Value<'a> = D::Value<'a>;
+}
+
+impl<R, I, D> IterRead for SstIter<R, I, D>
+where
+    R: BlockReader,
+    I: IndexBlockIter,
+    D: DataBlockIter + IterRead,
+{
+    fn valid(&self) -> bool {
+        self.data_iter.as_ref().map_or(false, |d| d.valid())
+    }
+
+    fn key(&self) -> Option<Self::Key<'_>> {
+        self.data_iter.as_ref()?.key()
+    }
+
+    fn value(&self) -> Option<Self::Value<'_>> {
+        self.data_iter.as_ref()?.value()
+    }
+}
+
+impl<R, I, D> ForwardIter for SstIter<R, I, D>
+where
+    R: BlockReader,
+    I: IndexBlockIter + for<'a> ForwardIter<Key<'a> = D::Key<'a>>,
+    for<'a> I::Value<'a>: AsArray<'a>,
+    D: DataBlockIter + ForwardIter,
+    for<'a> D::Value<'a>: AsArray<'a>,
+{
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.index_iter.seek_to_first()?;
         if self.index_iter.valid() {
-            let mut d = self.load_data_block()?;
+            let mut d = self.load_data_block_from_index()?;
             d.seek_to_first()?;
             self.data_iter = Some(d);
         }
         Ok(())
     }
 
-    fn seek<'a>(&mut self, target: &Self::Key<'a>) -> StorageResult<()> {
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
         self.index_iter.seek(target)?;
         if self.index_iter.valid() {
-            let mut d = self.load_data_block()?;
+            let mut d = self.load_data_block_from_index()?;
             d.seek(target)?;
             self.data_iter = Some(d);
         } else {
@@ -109,7 +129,7 @@ where
                 if !self.index_iter.valid() {
                     return Ok(());
                 }
-                let mut d = self.load_data_block()?;
+                let mut d = self.load_data_block_from_index()?;
                 d.seek_to_first()?;
                 self.data_iter = Some(d);
             }
@@ -121,86 +141,55 @@ where
 impl<R, I, D> ReverseIter for SstIter<R, I, D>
 where
     R: BlockReader,
-    I: IndexBlockIter,
+    D: DataBlockIter + ReverseIter,
+    I: IndexBlockIter  + ReverseIter,
     for<'a> I::Value<'a>: AsArray<'a>,
-    D: DataBlockIter,
-    for<'a> D::Value<'a>: AsArray<'a>,
-    for<'a> I: StorageIter<Key<'a> = D::Key<'a>>,
+    for<'a> I: IterBase<Key<'a> = D::Key<'a>>,
 {
-    fn seek_to_last(&mut self) -> StorageResult<()> {
-        self.index_iter.seek_to_last()?;
+    fn seek_to_first(&mut self) -> StorageResult<()> {
+        self.index_iter.seek_to_first()?;
         if self.index_iter.valid() {
-            let mut d = self.load_data_block()?;
-            d.seek_to_last()?;
+            let mut d = self.load_data_block_from_index()?;
+            d.seek_to_first()?;
             self.data_iter = Some(d);
         }
         Ok(())
     }
 
-    fn seek_for_prev<'a>(&mut self, target: &Self::Key<'a>) -> StorageResult<()> {
-        // Index uses end-key convention: each entry's key is the largest key
-        // in its data block. Forward seek (first end_key >= target) lands on
-        // the block that *may* contain target. If that block has no key <=
-        // target (target falls in a gap between blocks), fall back to the
-        // previous block whose keys are all < target.
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
         self.index_iter.seek(target)?;
-        if !self.index_iter.valid() {
-            self.index_iter.seek_to_last()?;
-        }
         loop {
             if !self.index_iter.valid() {
                 self.data_iter = None;
                 return Ok(());
             }
-            let mut d = self.load_data_block()?;
-            d.seek_for_prev(target)?;
+            let mut d = self.load_data_block_from_index()?;
+            d.seek(target)?;
             if d.valid() {
                 self.data_iter = Some(d);
                 return Ok(());
             }
             // Gap: all keys in this block exceed target — try previous block.
-            self.index_iter.prev()?;
+            self.index_iter.next()?;
         }
     }
 
-    fn prev(&mut self) -> StorageResult<()> {
+    fn next(&mut self) -> StorageResult<()> {
         if let Some(d) = &mut self.data_iter {
-            d.prev()?;
+            d.next()?;
             if !d.valid() {
-                self.index_iter.prev()?;
+                self.index_iter.next()?;
                 if !self.index_iter.valid() {
                     return Ok(());
                 }
-                let mut d = self.load_data_block()?;
-                d.seek_to_last()?;
+                let mut d = self.load_data_block_from_index()?;
+                d.seek_to_first()?;
                 self.data_iter = Some(d);
             }
         }
         Ok(())
     }
 }
-
-impl<R, I, D> StorageIter for SstIter<R, I, D>
-where
-    R: BlockReader,
-    I: IndexBlockIter,
-    for<'a> I::Value<'a>: AsArray<'a>,
-    D: DataBlockIter,
-    for<'a> D::Value<'a>: AsArray<'a>,
-    for<'a> I: StorageIter<Key<'a> = D::Key<'a>>,
-{
-    fn valid(&self) -> bool {
-        self.data_iter.as_ref().map_or(false, |d| d.valid())
-    }
-
-    fn key(&self) -> Option<Self::Key<'_>> {
-        self.data_iter.as_ref()?.key()
-    }
-    fn value(&self) -> Option<Self::Value<'_>> {
-        self.data_iter.as_ref()?.value()
-    }
-}
-
 
 #[cfg(test)]
 mod tests {
@@ -214,7 +203,7 @@ mod tests {
         iterators::{
             block_iter::NormalBlockIter,
             data_entry_decode_iter::DataEntryDecodeIter,
-            storage_iter::{AsArray, ForwardIter, StorageIter},
+            storage_iter::{AsArray, ForwardIter, IterBase, IterRead},
         },
         testing::init_tracing,
     };
@@ -231,7 +220,10 @@ mod tests {
 
     fn build_sst(n: u64, block_size: usize) -> (Vec<u8>, SstFooter, SstOption) {
         let option = SstOption::default().block_size(block_size);
-        let mut builder = SstBuilder::new(DefaultSstWriter::new(InMemoryBlockWriter::new(), &option), option.clone());
+        let mut builder = SstBuilder::new(
+            DefaultSstWriter::new(InMemoryBlockWriter::new(), &option),
+            option.clone(),
+        );
         for i in 0..n {
             builder.add(make_key(i), make_value(i)).unwrap();
         }
@@ -244,8 +236,10 @@ mod tests {
     ) -> SstIter<InMemoryBlockReader, NormalBlockIter, DataEntryDecodeIter<NormalBlockIter>> {
         let (bytes, footer, option) = build_sst(n, block_size);
         let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(bytes), block_size));
-        SstIter::<_, NormalBlockIter, DataEntryDecodeIter<NormalBlockIter>>::new(reader, footer, option)
-            .unwrap()
+        SstIter::<_, NormalBlockIter, DataEntryDecodeIter<NormalBlockIter>>::new(
+            reader, footer, option,
+        )
+        .unwrap()
     }
 
     // 空 SST seek_to_first 后 valid() 应为 false

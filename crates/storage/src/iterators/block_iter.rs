@@ -1,15 +1,15 @@
 use core::fmt;
-use std::fmt::Write;
 
 use bytes::Bytes;
 use tracing::debug;
 
 use crate::{
     errors::StorageResult,
-    iterators::storage_iter::{AsArray, DataBlockIter, ForwardIter, IndexBlockIter, ReverseIter, StorageIter},
-    row_key::{BinaryKey, RowKey},
+    iterators::storage_iter::{
+        AsArray, DataBlockIter, ForwardIter, IndexBlockIter, IterBase, IterRead, ReverseIter,
+    },
+    row_key::RowKey,
 };
-
 
 pub struct RawEntry<'a> {
     buf: &'a [u8],
@@ -87,10 +87,32 @@ impl NormalBlockIter {
         self.values_offsets.clear();
     }
 }
-impl ForwardIter for NormalBlockIter {
+impl IterBase for NormalBlockIter {
     type Key<'a> = RowKey<'a>;
     type Value<'a> = RawEntry<'a>;
+}
 
+impl IterRead for NormalBlockIter {
+    fn valid(&self) -> bool {
+        self.curr.is_some()
+    }
+
+    fn key(&self) -> Option<Self::Key<'_>> {
+        let i = self.curr?;
+        let start = self.key_offsets[i];
+        let end = self.key_offsets[i + 1]; // sentinel always present
+        Some(RowKey::from(&self.block[start..end]))
+    }
+
+    fn value(&self) -> Option<Self::Value<'_>> {
+        let i = self.curr?;
+        let start = self.values_offsets[i];
+        let end = self.values_offsets[i + 1]; // sentinel always present
+        Some(RawEntry::from(&self.block[start..end]))
+    }
+}
+
+impl ForwardIter for NormalBlockIter {
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.curr = (self.count > 0).then_some(0);
         Ok(())
@@ -119,13 +141,14 @@ impl ForwardIter for NormalBlockIter {
         Ok(())
     }
 }
+
 impl ReverseIter for NormalBlockIter {
-    fn seek_to_last(&mut self) -> StorageResult<()> {
+    fn seek_to_first(&mut self) -> StorageResult<()> {
         self.curr = (self.count > 0).then_some(self.count - 1);
         Ok(())
     }
 
-    fn seek_for_prev(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
         // Binary search for upper_bound (first key > target), then subtract 1.
         let mut lo = 0usize;
         let mut hi = self.count;
@@ -143,29 +166,9 @@ impl ReverseIter for NormalBlockIter {
         Ok(())
     }
 
-    fn prev(&mut self) -> StorageResult<()> {
+    fn next(&mut self) -> StorageResult<()> {
         self.curr = self.curr.and_then(|i| i.checked_sub(1));
         Ok(())
-    }
-}
-
-impl StorageIter for NormalBlockIter {
-    fn valid(&self) -> bool {
-        self.curr.is_some()
-    }
-
-    fn key(&self) -> Option<Self::Key<'_>> {
-        let i = self.curr?;
-        let start = self.key_offsets[i];
-        let end = self.key_offsets[i + 1]; // sentinel always present
-        Some(RowKey::from(&self.block[start..end]))
-    }
-
-    fn value(&self) -> Option<Self::Value<'_>> {
-        let i = self.curr?;
-        let start = self.values_offsets[i];
-        let end = self.values_offsets[i + 1]; // sentinel always present
-        Some(RawEntry::from(&self.block[start..end]))
     }
 }
 
@@ -194,6 +197,13 @@ impl IndexBlockIter for NormalBlockIter {
     fn from_block(block: bytes::Bytes) -> StorageResult<Self> {
         NormalBlockIter::new(block)
     }
+
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+        // Reuse the ForwardIter lower-bound implementation; NormalBlockIter
+        // serves as both index and data block format, and index-block seek
+        // is the same lower_bound semantics.
+        ForwardIter::seek(self, target)
+    }
 }
 
 impl DataBlockIter for NormalBlockIter {
@@ -207,7 +217,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::{
-        iterators::storage_iter::{AsArray, ForwardIter, StorageIter},
+        iterators::storage_iter::{AsArray, ForwardIter, IterRead},
         row_key::BinaryKey,
     };
 

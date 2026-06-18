@@ -43,7 +43,7 @@ fn test_write_then_scan_roundtrip() {
     layer.write("t1", batch).unwrap();
 
     let range = (Bound::Unbounded, Bound::Unbounded);
-    let mut scanner = layer.scan("t1", range).unwrap();
+    let mut scanner = layer.scan("t1", range, false).unwrap();
     let rows = collect_scan(&mut *scanner);
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].0, key("k1"));
@@ -72,7 +72,7 @@ fn test_delete_tombstone() {
     layer.write("t1", del).unwrap();
 
     let range = (Bound::Unbounded, Bound::Unbounded);
-    let mut scanner = layer.scan("t1", range).unwrap();
+    let mut scanner = layer.scan("t1", range, false).unwrap();
     let rows = collect_scan(&mut *scanner);
     // k1 is deleted tombstone, k2 still present.
     assert_eq!(rows.len(), 2);
@@ -99,7 +99,7 @@ fn test_range_scan_lower_bound() {
 
     // Scan [k03, unbounded).
     let range = (Bound::Included(key("k03")), Bound::Unbounded);
-    let mut scanner = layer.scan("t1", range).unwrap();
+    let mut scanner = layer.scan("t1", range, false).unwrap();
     let rows = collect_scan(&mut *scanner);
     assert_eq!(rows.len(), 7); // k03..k09
     assert_eq!(rows[0].0, key("k03"));
@@ -124,7 +124,7 @@ fn test_range_scan_upper_bound() {
 
     // Scan [unbounded, k05).
     let range = (Bound::Unbounded, Bound::Excluded(key("k05")));
-    let mut scanner = layer.scan("t1", range).unwrap();
+    let mut scanner = layer.scan("t1", range, false).unwrap();
     let rows = collect_scan(&mut *scanner);
     assert_eq!(rows.len(), 5); // k00..k04
     assert_eq!(rows.last().unwrap().0, key("k04"));

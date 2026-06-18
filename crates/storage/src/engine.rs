@@ -17,5 +17,5 @@ pub const DEFAULT_SHARD: ShardId = 0;
 /// it accepts a key range and returns data.
 pub trait StorageEngine: Send + Sync + 'static {
     fn write(&self, batch: WriteBatch) -> StorageResult<()>;
-    fn scan(&self, range: (Bound<Bytes>, Bound<Bytes>)) -> StorageResult<Box<dyn ScanIter>>;
+    fn scan(&self, range: (Bound<Bytes>, Bound<Bytes>), reverse: bool) -> StorageResult<Box<dyn ScanIter>>;
 }

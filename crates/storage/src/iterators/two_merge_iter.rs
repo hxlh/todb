@@ -1,4 +1,7 @@
-use crate::{errors::StorageResult, iterators::storage_iter::{ForwardIter, ReverseIter, StorageIter}};
+use crate::{
+    errors::StorageResult,
+    iterators::storage_iter::{ForwardIter, IterBase, IterRead, ReverseIter},
+};
 
 enum Current {
     A,
@@ -8,7 +11,7 @@ enum Current {
 /// Two-way merge iterator. A (memtable side) wins on equal keys, B is skipped.
 ///
 /// A and B must share the same key and value types. B's key type is constrained
-/// to equal A's via `for<'a> B: StorageIter<Key<'a> = A::Key<'a>>`, and likewise
+/// to equal A's via `for<'a> B: ForwardIter<Key<'a> = A::Key<'a>>`, and likewise
 /// for value type.
 pub struct TwoMergeIter<A, B> {
     a: A,
@@ -16,10 +19,11 @@ pub struct TwoMergeIter<A, B> {
     current: Option<Current>,
 }
 
+/// Forward-facing helper methods.
 impl<A, B> TwoMergeIter<A, B>
 where
-    A: 'static + StorageIter,
-    B: 'static + for<'a> StorageIter<Key<'a> = A::Key<'a>, Value<'a> = A::Value<'a>>,
+    A: 'static + ForwardIter,
+    B: 'static + for<'a> ForwardIter<Key<'a> = A::Key<'a>, Value<'a> = A::Value<'a>>,
 {
     pub fn new(mut a: A, mut b: B) -> StorageResult<Self> {
         a.seek_to_first()?;
@@ -57,6 +61,14 @@ where
         }
         Ok(())
     }
+}
+
+/// Reverse-facing helper methods.
+impl<A, B> TwoMergeIter<A, B>
+where
+    A: 'static + ReverseIter,
+    B: 'static + for<'a> ReverseIter<Key<'a> = A::Key<'a>, Value<'a> = A::Value<'a>>,
+{
     fn choose_reverse(&self) -> Option<Current> {
         match (self.a.valid(), self.b.valid()) {
             (false, false) => None,
@@ -76,88 +88,25 @@ where
 
     fn skip_b_if_equal_rev(&mut self) -> StorageResult<()> {
         while self.a.valid() && self.b.valid() && self.a.key() == self.b.key() {
-            self.b.prev()?;
+            self.b.next()?;
         }
         Ok(())
     }
 }
 
-impl<A, B> ForwardIter for TwoMergeIter<A, B>
+impl<A, B> IterBase for TwoMergeIter<A, B>
 where
-    A: 'static + StorageIter,
-    B: 'static + for<'a> StorageIter<Key<'a> = A::Key<'a>, Value<'a> = A::Value<'a>>,
+    A: 'static + IterBase,
+    B: 'static + for<'a> IterBase<Key<'a> = A::Key<'a>, Value<'a> = A::Value<'a>>,
 {
     type Key<'a> = A::Key<'a>;
-    type Value<'a>
-        = A::Value<'a>
-    where
-        Self: 'a;
-
-    fn seek_to_first(&mut self) -> StorageResult<()> {
-        self.a.seek_to_first()?;
-        self.b.seek_to_first()?;
-        self.skip_b_if_equal()?;
-        self.current = self.choose();
-        Ok(())
-    }
-
-    fn seek<'k>(&mut self, target: &Self::Key<'k>) -> StorageResult<()> {
-        self.a.seek(target)?;
-        self.b.seek(target)?;
-        self.skip_b_if_equal()?;
-        self.current = self.choose();
-        Ok(())
-    }
-
-    fn next(&mut self) -> StorageResult<()> {
-        match self.current {
-            Some(Current::A) => self.a.next()?,
-            Some(Current::B) => self.b.next()?,
-            None => return Ok(()),
-        }
-        self.skip_b_if_equal()?;
-        self.current = self.choose();
-        Ok(())
-    }
+    type Value<'a> = A::Value<'a>;
 }
 
-impl<A, B> ReverseIter for TwoMergeIter<A, B>
+impl<A, B> IterRead for TwoMergeIter<A, B>
 where
-    A: 'static + StorageIter,
-    B: 'static + for<'a> StorageIter<Key<'a> = A::Key<'a>, Value<'a> = A::Value<'a>>,
-{
-    fn seek_to_last(&mut self) -> StorageResult<()> {
-        self.a.seek_to_last()?;
-        self.b.seek_to_last()?;
-        self.skip_b_if_equal_rev()?;
-        self.current = self.choose_reverse();
-        Ok(())
-    }
-
-    fn seek_for_prev(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
-        self.a.seek_for_prev(target)?;
-        self.b.seek_for_prev(target)?;
-        self.skip_b_if_equal_rev()?;
-        self.current = self.choose_reverse();
-        Ok(())
-    }
-
-    fn prev(&mut self) -> StorageResult<()> {
-        match self.current {
-            Some(Current::A) => self.a.prev()?,
-            Some(Current::B) => self.b.prev()?,
-            None => return Ok(()),
-        }
-        self.skip_b_if_equal_rev()?;
-        self.current = self.choose_reverse();
-        Ok(())
-    }
-}
-
-impl<A, B> StorageIter for TwoMergeIter<A, B>
-where
-    A: 'static + StorageIter,
-    B: 'static + for<'a> StorageIter<Key<'a> = A::Key<'a>, Value<'a> = A::Value<'a>>,
+    A: 'static + IterRead,
+    B: 'static + IterRead + for<'a> IterBase<Key<'a> = A::Key<'a>, Value<'a> = A::Value<'a>>,
 {
     fn valid(&self) -> bool {
         self.current.is_some()
@@ -180,10 +129,76 @@ where
     }
 }
 
+impl<A, B> ForwardIter for TwoMergeIter<A, B>
+where
+    A: 'static + ForwardIter,
+    B: 'static + for<'a> ForwardIter<Key<'a> = A::Key<'a>, Value<'a> = A::Value<'a>>,
+{
+    fn seek_to_first(&mut self) -> StorageResult<()> {
+        self.a.seek_to_first()?;
+        self.b.seek_to_first()?;
+        self.skip_b_if_equal()?;
+        self.current = self.choose();
+        Ok(())
+    }
+
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+        self.a.seek(target)?;
+        self.b.seek(target)?;
+        self.skip_b_if_equal()?;
+        self.current = self.choose();
+        Ok(())
+    }
+
+    fn next(&mut self) -> StorageResult<()> {
+        match self.current {
+            Some(Current::A) => self.a.next()?,
+            Some(Current::B) => self.b.next()?,
+            None => return Ok(()),
+        }
+        self.skip_b_if_equal()?;
+        self.current = self.choose();
+        Ok(())
+    }
+}
+
+impl<A, B> ReverseIter for TwoMergeIter<A, B>
+where
+    A: 'static + ReverseIter,
+    B: 'static + for<'a> ReverseIter<Key<'a> = A::Key<'a>, Value<'a> = A::Value<'a>>,
+{
+    fn seek_to_first(&mut self) -> StorageResult<()> {
+        self.a.seek_to_first()?;
+        self.b.seek_to_first()?;
+        self.skip_b_if_equal_rev()?;
+        self.current = self.choose_reverse();
+        Ok(())
+    }
+
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+        self.a.seek(target)?;
+        self.b.seek(target)?;
+        self.skip_b_if_equal_rev()?;
+        self.current = self.choose_reverse();
+        Ok(())
+    }
+
+    fn next(&mut self) -> StorageResult<()> {
+        match self.current {
+            Some(Current::A) => self.a.next()?,
+            Some(Current::B) => self.b.next()?,
+            None => return Ok(()),
+        }
+        self.skip_b_if_equal_rev()?;
+        self.current = self.choose_reverse();
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iterators::storage_iter::{ForwardIter, ReverseIter, StorageIter};
+    use crate::iterators::storage_iter::{ForwardIter, IterRead, ReverseIter};
 
     struct VecIter {
         data: Vec<(&'static [u8], &'static [u8])>,
@@ -199,71 +214,12 @@ mod tests {
         }
     }
 
-    impl ForwardIter for VecIter {
+    impl IterBase for VecIter {
         type Key<'a> = &'a [u8];
-        type Value<'a>
-            = &'a [u8]
-        where
-            Self: 'a;
-
-        fn seek_to_first(&mut self) -> crate::errors::StorageResult<()> {
-            self.pos = if self.data.is_empty() { usize::MAX } else { 0 };
-            Ok(())
-        }
-
-        fn seek<'a>(&mut self, target: &Self::Key<'a>) -> crate::errors::StorageResult<()> {
-            self.pos = self.data.partition_point(|(k, _)| k < target);
-            if self.pos >= self.data.len() {
-                self.pos = usize::MAX;
-            }
-            Ok(())
-        }
-
-        fn next(&mut self) -> crate::errors::StorageResult<()> {
-            if self.valid() {
-                self.pos += 1;
-                if self.pos >= self.data.len() {
-                    self.pos = usize::MAX;
-                }
-            }
-            Ok(())
-        }
+        type Value<'a> = &'a [u8];
     }
 
-    impl ReverseIter for VecIter {
-        fn seek_to_last(&mut self) -> crate::errors::StorageResult<()> {
-            self.pos = if self.data.is_empty() { usize::MAX } else { self.data.len() - 1 };
-            Ok(())
-        }
-
-        fn seek_for_prev<'a>(
-            &mut self,
-            target: &Self::Key<'a>,
-        ) -> crate::errors::StorageResult<()> {
-            let lo = self.data.partition_point(|(k, _)| k < target);
-            if lo == 0 && (self.data.is_empty() || self.data[0].0 > *target) {
-                self.pos = usize::MAX;
-            } else if lo < self.data.len() && self.data[lo].0 == *target {
-                self.pos = lo;
-            } else {
-                self.pos = lo - 1;
-            }
-            Ok(())
-        }
-
-        fn prev(&mut self) -> crate::errors::StorageResult<()> {
-            if self.valid() {
-                if self.pos == 0 {
-                    self.pos = usize::MAX;
-                } else {
-                    self.pos -= 1;
-                }
-            }
-            Ok(())
-        }
-    }
-
-    impl StorageIter for VecIter {
+    impl IterRead for VecIter {
         fn valid(&self) -> bool {
             self.pos < self.data.len()
         }
@@ -285,11 +241,75 @@ mod tests {
         }
     }
 
+    impl ForwardIter for VecIter {
+        fn seek_to_first(&mut self) -> crate::errors::StorageResult<()> {
+            self.pos = if self.data.is_empty() { usize::MAX } else { 0 };
+            Ok(())
+        }
+
+        fn seek<'a>(
+            &mut self,
+            target: &Self::Key<'a>,
+        ) -> crate::errors::StorageResult<()> {
+            self.pos = self.data.partition_point(|(k, _)| k < target);
+            if self.pos >= self.data.len() {
+                self.pos = usize::MAX;
+            }
+            Ok(())
+        }
+
+        fn next(&mut self) -> crate::errors::StorageResult<()> {
+            if self.valid() {
+                self.pos += 1;
+                if self.pos >= self.data.len() {
+                    self.pos = usize::MAX;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl ReverseIter for VecIter {
+        fn seek_to_first(&mut self) -> crate::errors::StorageResult<()> {
+            self.pos = if self.data.is_empty() { usize::MAX } else { self.data.len() - 1 };
+            Ok(())
+        }
+
+        fn seek<'a>(
+            &mut self,
+            target: &Self::Key<'a>,
+        ) -> crate::errors::StorageResult<()> {
+            let lo = self.data.partition_point(|(k, _)| k < target);
+            if lo == 0 && (self.data.is_empty() || self.data[0].0 > *target) {
+                self.pos = usize::MAX;
+            } else if lo < self.data.len() && self.data[lo].0 == *target {
+                self.pos = lo;
+            } else {
+                self.pos = lo - 1;
+            }
+            Ok(())
+        }
+
+        fn next(&mut self) -> crate::errors::StorageResult<()> {
+            if self.valid() {
+                if self.pos == 0 {
+                    self.pos = usize::MAX;
+                } else {
+                    self.pos -= 1;
+                }
+            }
+            Ok(())
+        }
+    }
+
     fn collect(iter: &mut TwoMergeIter<VecIter, VecIter>) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut out = vec![];
         while iter.valid() {
-            out.push((iter.key().unwrap().to_vec(), iter.value().unwrap().to_vec()));
-            iter.next().unwrap();
+            out.push((
+                iter.key().unwrap().to_vec(),
+                iter.value().unwrap().to_vec(),
+            ));
+            ForwardIter::next(iter).unwrap();
         }
         out
     }
@@ -349,7 +369,7 @@ mod tests {
         let a = VecIter::new(vec![(b"a", b"va"), (b"c", b"vc")]);
         let b = VecIter::new(vec![(b"b", b"vb"), (b"d", b"vd")]);
         let mut iter = TwoMergeIter::new(a, b).unwrap();
-        iter.seek(&b"c".as_ref()).unwrap();
+        ForwardIter::seek(&mut iter, &b"c".as_ref()).unwrap();
         let result = collect(&mut iter);
         assert_eq!(
             result,

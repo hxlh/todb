@@ -6,7 +6,7 @@ use crate::{
     iterators::{
         concat_iter::ConcatIter,
         merge_iter::MergeIter,
-        storage_iter::{ForwardIter, ReverseIter, StorageIter},
+        storage_iter::{ForwardIter, IterRead, ReverseIter},
         sst_iter::SstIter,
     },
     row_key::RowKey,
@@ -14,17 +14,17 @@ use crate::{
 
 use super::helpers::{make_key, make_sst_iter, make_value};
 
-/// Collect keys by walking backward via `seek_to_last` + repeated `prev`.
-fn collect_keys_reverse<I: StorageIter>(iter: &mut I) -> Vec<u64>
+/// Collect keys by walking backward via `seek_to_first` + repeated `next`.
+fn collect_keys_reverse<I: ReverseIter>(iter: &mut I) -> Vec<u64>
 where
     for<'a> I::Key<'a>: AsRef<[u8]>,
 {
     let mut keys = vec![];
-    iter.seek_to_last().unwrap();
+    iter.seek_to_first().unwrap();
     while iter.valid() {
         let bytes: Vec<u8> = iter.key().unwrap().as_ref().to_vec();
         keys.push(u64::from_be_bytes(bytes.try_into().unwrap()));
-        iter.prev().unwrap();
+        iter.next().unwrap();
     }
     keys
 }
@@ -42,7 +42,7 @@ fn test_sst_seek_to_last_descending() {
 #[test]
 fn test_sst_seek_for_prev_exact() {
     let mut iter = make_sst_iter(0, 10);
-    iter.seek_for_prev(&(&make_key(5)).into()).unwrap();
+    ReverseIter::seek(&mut iter, &(&make_key(5)).into()).unwrap();
     assert!(iter.valid());
     assert_eq!(iter.key().unwrap(), (&make_key(5)).into());
 }
@@ -50,11 +50,11 @@ fn test_sst_seek_for_prev_exact() {
 #[test]
 fn test_sst_seek_for_prev_between() {
     let mut iter = make_sst_iter(0, 10); // keys 0..9 (even only implied by make_key)
-    iter.seek_for_prev(&(&make_key(5)).into()).unwrap();
+    ReverseIter::seek(&mut iter, &(&make_key(5)).into()).unwrap();
     // seek_for_prev positions at last key <= target → key 5
     assert_eq!(iter.key().unwrap(), (&make_key(5)).into());
     // prev walks backward
-    iter.prev().unwrap();
+    ReverseIter::next(&mut iter).unwrap();
     assert_eq!(iter.key().unwrap(), (&make_key(4)).into());
 }
 
@@ -66,14 +66,14 @@ fn test_sst_seek_for_prev_before_all_keys() {
     // Key bytes are u64 big-endian, so key 5 = 0x0000...0005.
     let zero = make_key(0);
     let small_target: RowKey<'_> = (&zero).into();
-    iter.seek_for_prev(&small_target).unwrap();
+    ReverseIter::seek(&mut iter, &small_target).unwrap();
     assert!(!iter.valid());
 }
 
 #[test]
 fn test_sst_seek_for_prev_after_all_keys() {
     let mut iter = make_sst_iter(0, 5); // keys 0..4
-    iter.seek_for_prev(&(&make_key(u64::MAX)).into()).unwrap();
+    ReverseIter::seek(&mut iter, &(&make_key(u64::MAX)).into()).unwrap();
     assert!(iter.valid());
     assert_eq!(iter.key().unwrap(), (&make_key(4)).into());
 }
@@ -81,13 +81,13 @@ fn test_sst_seek_for_prev_after_all_keys() {
 #[test]
 fn test_sst_prev_exhaustion() {
     let mut iter = make_sst_iter(0, 3);
-    iter.seek_to_last().unwrap();
+    ReverseIter::seek_to_first(&mut iter).unwrap();
     assert!(iter.valid());
-    iter.prev().unwrap(); // key 1
+    ReverseIter::next(&mut iter).unwrap(); // key 1
     assert!(iter.valid());
-    iter.prev().unwrap(); // key 0
+    ReverseIter::next(&mut iter).unwrap(); // key 0
     assert!(iter.valid());
-    iter.prev().unwrap(); // past first → invalid
+    ReverseIter::next(&mut iter).unwrap(); // past first → invalid
     assert!(!iter.valid());
 }
 
@@ -129,17 +129,17 @@ fn test_merge_reverse_overlapping_no_dedup() {
 #[test]
 fn test_merge_seek_for_prev() {
     let mut iter = MergeIter::new(vec![make_sst_iter(0, 5), make_sst_iter(5, 10)]);
-    iter.seek_for_prev(&(&make_key(6)).into()).unwrap();
+    ReverseIter::seek(&mut iter, &(&make_key(6)).into()).unwrap();
     assert!(iter.valid());
     assert_eq!(iter.key().unwrap(), (&make_key(6)).into());
-    iter.prev().unwrap();
+    ReverseIter::next(&mut iter).unwrap();
     assert_eq!(iter.key().unwrap(), (&make_key(5)).into());
 }
 
 #[test]
 fn test_merge_seek_for_prev_before_all() {
     let mut iter = MergeIter::new(vec![make_sst_iter(5, 10)]);
-    iter.seek_for_prev(&(&make_key(0)).into()).unwrap();
+    ReverseIter::seek(&mut iter, &(&make_key(0)).into()).unwrap();
     assert!(!iter.valid());
 }
 
@@ -156,7 +156,7 @@ fn test_concat_reverse_descending() {
 #[test]
 fn test_concat_seek_for_prev() {
     let mut iter = ConcatIter::new(vec![make_sst_iter(0, 3), make_sst_iter(3, 6)]);
-    iter.seek_for_prev(&(&make_key(4)).into()).unwrap();
+    ReverseIter::seek(&mut iter, &(&make_key(4)).into()).unwrap();
     assert!(iter.valid());
     assert_eq!(iter.key().unwrap(), (&make_key(4)).into());
 }
@@ -169,15 +169,15 @@ fn test_concat_seek_for_prev() {
 fn test_forward_then_reverse_reseek() {
     let mut iter = MergeIter::new(vec![make_sst_iter(0, 10)]);
     // Forward scan first
-    iter.seek_to_first().unwrap();
+    ForwardIter::seek_to_first(&mut iter).unwrap();
     assert_eq!(iter.key().unwrap(), (&make_key(0)).into());
-    iter.next().unwrap();
+    ForwardIter::next(&mut iter).unwrap();
     assert_eq!(iter.key().unwrap(), (&make_key(1)).into());
 
     // Switch to reverse — must rebuild heap
-    iter.seek_to_last().unwrap();
+    ReverseIter::seek_to_first(&mut iter).unwrap();
     assert_eq!(iter.key().unwrap(), (&make_key(9)).into());
-    iter.prev().unwrap();
+    ReverseIter::next(&mut iter).unwrap();
     assert_eq!(iter.key().unwrap(), (&make_key(8)).into());
 }
 
@@ -213,7 +213,7 @@ fn test_sst_seek_for_prev_gap_between_blocks() {
     //   With fallback: prev to Block 0, → key 6
     let mut iter = make_sst_with_keys(&[0, 2, 4, 6, 8, 10, 12, 14], 128);
     let seven = make_key(7);
-    iter.seek_for_prev(&(&seven).into()).unwrap();
+    ReverseIter::seek(&mut iter, &(&seven).into()).unwrap();
     assert!(iter.valid());
     assert_eq!(iter.key().unwrap(), (&make_key(6)).into());
 }
@@ -223,6 +223,6 @@ fn test_sst_seek_for_prev_gap_before_first_block() {
     // All keys > target → no fallback possible → invalid
     let mut iter = make_sst_with_keys(&[10, 20, 30], 128);
     let five = make_key(5);
-    iter.seek_for_prev(&(&five).into()).unwrap();
+    ReverseIter::seek(&mut iter, &(&five).into()).unwrap();
     assert!(!iter.valid());
 }

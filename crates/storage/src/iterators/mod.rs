@@ -11,4 +11,4 @@ pub use data_entry_decode_iter::EntryValue;
 pub use two_merge_iter::TwoMergeIter;
 pub(crate) mod data_entry_decode_iter;
 pub(crate) mod index_entry_decode_iter;
-pub use scan_iter::{ScanAdapter, ScanIter};
+pub use scan_iter::{ScanIter};

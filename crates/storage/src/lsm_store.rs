@@ -10,13 +10,12 @@ use crate::{
     engine::StorageEngine,
     errors::StorageResult,
     iterators::{
-        EntryValue,
         map_iter::MapIter,
         concat_iter::ConcatIter,
         merge_iter::MergeIter,
         scan_iter::ScanIter,
         sst_iter::SstIter,
-        storage_iter::{AsArray, ForwardIter, StorageIter},
+        storage_iter::{AsArray, ForwardIter, ReverseIter},
         two_merge_iter::TwoMergeIter,
     },
     lsm_state::{LsmOption, LsmState},
@@ -99,10 +98,30 @@ impl StorageEngine for LsmStore {
         Ok(())
     }
 
-    fn scan(&self, range: (Bound<Bytes>, Bound<Bytes>)) -> StorageResult<Box<dyn ScanIter>> {
+    fn scan(
+        &self,
+        range: (Bound<Bytes>, Bound<Bytes>),
+        reverse: bool,
+    ) -> StorageResult<Box<dyn ScanIter>> {
         let state = self.snapshot();
+        let merged = self.build_merged_iter(&state)?;
 
-        // Build memtable iterators (active + all imms).
+        if reverse {
+            let mut scan = LsmReverseScan::new(merged, range.0, range.1);
+            scan.init()?;
+            Ok(Box::new(scan))
+        } else {
+            let mut scan = LsmForwardScan::new(merged, range.0, range.1);
+            scan.init()?;
+            Ok(Box::new(scan))
+        }
+    }
+}
+
+impl LsmStore {
+    fn build_merged_iter(&self, state: &LsmState) -> StorageResult<MergedIter> {
+        let block_size = self.option.block_size;
+
         let mut mem_iters: Vec<MapIter<OwnedMemTableIter<Bytes, Bytes>>> =
             vec![MapIter::new(state.active_mem.iter())];
         for imm in &state.imm_memtables {
@@ -110,16 +129,6 @@ impl StorageEngine for LsmStore {
         }
         let mem_merge = MergeIter::new(mem_iters);
 
-        // SST 侧：
-        //   L0   → MergeIter<SstIter>           (多次 flush 可能 overlap，堆合并)
-        //   L1+  → MergeIter<ConcatIter<SstIter>> (同层不重叠用 ConcatIter，跨层 merge)
-        //   合并 → TwoMergeIter(L0, L1+)         (A 侧 L0 更新，同 key 胜出)
-        //
-        // 读优先级（从新到旧）：
-        //   active_mem > imm[0..n] > L0 SSTs > L1 SSTs > ... > LN SSTs
-        let block_size = self.option.block_size;
-
-        // L0: MergeIter (SST 间可能 overlap)
         let l0_iters: Vec<SstIter<FileBlockReader>> = state
             .levels
             .first()
@@ -133,7 +142,6 @@ impl StorageEngine for LsmStore {
             .collect::<StorageResult<_>>()?;
         let l0_merge = MergeIter::new(l0_iters);
 
-        // L1+: 每层 ConcatIter（同层有序不重叠），跨层 MergeIter
         let ln_iters: Vec<ConcatIter<SstIter<FileBlockReader>>> = state
             .levels
             .iter()
@@ -153,63 +161,63 @@ impl StorageEngine for LsmStore {
             .collect::<StorageResult<_>>()?;
         let ln_merge = MergeIter::new(ln_iters);
 
-        // L0 (A) wins over L1+ (B) on key overlap.
         let sst_merge = TwoMergeIter::new(l0_merge, ln_merge)?;
-
-        let merged = TwoMergeIter::new(mem_merge, sst_merge)?;
-
-        let mut scanner = LsmScanIter {
-            inner: merged,
-            upper: range.1,
-        };
-
-        // Position at the lower bound.
-        match &range.0 {
-            Bound::Included(start) => scanner.seek(start)?,
-            Bound::Excluded(start) => {
-                scanner.seek(start)?;
-                // Skip past any entries equal to the excluded key.
-                while scanner.raw_valid() {
-                    match scanner.inner.key() {
-                        Some(k) if k.as_bytes() == start.as_ref() => scanner.inner.next()?,
-                        _ => break,
-                    }
-                }
-            }
-            Bound::Unbounded => {
-                scanner.seek_to_first()?;
-            }
-        }
-
-        Ok(Box::new(scanner))
+        TwoMergeIter::new(mem_merge, sst_merge)
     }
 }
 
-/// Range-limited scanner wrapping the merged LSM iterator.
-///
-/// Enforces the upper bound by returning `valid() == false` once the iterator
-/// passes the end of the scan range.
-pub struct LsmScanIter {
-    inner: MergedIter,
+// ── Forward range-limited scan ──
+
+/// Forward scan: lower bound positions via seek, upper bound enforced in `valid()`.
+pub struct LsmForwardScan<I: ForwardIter> {
+    inner: I,
+    lower: Bound<Bytes>,
     upper: Bound<Bytes>,
 }
 
-impl LsmScanIter {
-    /// Whether the inner iterator has a current element (ignoring range).
-    fn raw_valid(&self) -> bool {
-        self.inner.valid()
+impl<I> LsmForwardScan<I>
+where
+    I: ForwardIter,
+    for<'a> I::Key<'a>: From<&'a [u8]>,
+{
+    fn new(inner: I, lower: Bound<Bytes>, upper: Bound<Bytes>) -> Self {
+        Self { inner, lower, upper }
+    }
+
+    fn init(&mut self) -> StorageResult<()> {
+        match &self.lower {
+            Bound::Included(start) => self.inner.seek(&start.as_ref().into()),
+            Bound::Excluded(start) => {
+                self.inner.seek(&start.as_ref().into())?;
+                while self.inner.valid() {
+                    let is_equal = self.inner.key().map_or(false, |k| k == start.as_ref().into());
+                    if is_equal {
+                        self.inner.next()?;
+                    } else {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            Bound::Unbounded => self.inner.seek_to_first(),
+        }
     }
 }
 
-impl ScanIter for LsmScanIter {
+impl<I> ScanIter for LsmForwardScan<I>
+where
+    I: ForwardIter + Send,
+    for<'a> I::Key<'a>: AsArray<'a> + From<&'a [u8]>,
+    for<'a> I::Value<'a>: Into<Entry<&'a [u8]>>,
+{
     fn valid(&self) -> bool {
-        if !self.raw_valid() {
+        if !self.inner.valid() {
             return false;
         }
         let key = self.inner.key().unwrap();
         match &self.upper {
-            Bound::Included(end) => key.as_bytes() <= end.as_ref(),
-            Bound::Excluded(end) => key.as_bytes() < end.as_ref(),
+            Bound::Included(end) => key <= (&end[..]).into(),
+            Bound::Excluded(end) => key < (&end[..]).into(),
             Bound::Unbounded => true,
         }
     }
@@ -219,7 +227,7 @@ impl ScanIter for LsmScanIter {
     }
 
     fn seek(&mut self, target: &[u8]) -> StorageResult<()> {
-        self.inner.seek(&crate::row_key::BinaryKey::from(target))
+        self.inner.seek(&target.into())
     }
 
     fn next(&mut self) -> StorageResult<()> {
@@ -237,6 +245,89 @@ impl ScanIter for LsmScanIter {
         if !self.valid() {
             return None;
         }
-        self.inner.value().map(|v: EntryValue| v.into())
+        self.inner.value().map(|v| v.into())
+    }
+}
+
+// ── Reverse range-limited scan ──
+
+/// Reverse scan: upper bound positions via seek, lower bound enforced in `valid()`.
+pub struct LsmReverseScan<I: ReverseIter> {
+    inner: I,
+    lower: Bound<Bytes>,
+    upper: Bound<Bytes>,
+}
+
+impl<I> LsmReverseScan<I>
+where
+    I: ReverseIter,
+    for<'a> I::Key<'a>: From<&'a [u8]>,
+{
+    fn new(inner: I, lower: Bound<Bytes>, upper: Bound<Bytes>) -> Self {
+        Self { inner, lower, upper }
+    }
+
+    fn init(&mut self) -> StorageResult<()> {
+        match &self.upper {
+            Bound::Included(end) => self.inner.seek(&end.as_ref().into()),
+            Bound::Excluded(end) => {
+                self.inner.seek(&end.as_ref().into())?;
+                while self.inner.valid() {
+                    let is_equal = self.inner.key().map_or(false, |k| k == end.as_ref().into());
+                    if is_equal {
+                        self.inner.next()?;
+                    } else {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            Bound::Unbounded => self.inner.seek_to_first(),
+        }
+    }
+}
+
+impl<I> ScanIter for LsmReverseScan<I>
+where
+    I: ReverseIter + Send,
+    for<'a> I::Key<'a>: AsArray<'a> + From<&'a [u8]>,
+    for<'a> I::Value<'a>: Into<Entry<&'a [u8]>>,
+{
+    fn valid(&self) -> bool {
+        if !self.inner.valid() {
+            return false;
+        }
+        let key = self.inner.key().unwrap();
+        match &self.lower {
+            Bound::Included(start) => key >= (&start[..]).into(),
+            Bound::Excluded(start) => key > (&start[..]).into(),
+            Bound::Unbounded => true,
+        }
+    }
+
+    fn seek_to_first(&mut self) -> StorageResult<()> {
+        self.inner.seek_to_first()
+    }
+
+    fn seek(&mut self, target: &[u8]) -> StorageResult<()> {
+        self.inner.seek(&target.into())
+    }
+
+    fn next(&mut self) -> StorageResult<()> {
+        self.inner.next()
+    }
+
+    fn key(&self) -> Option<&[u8]> {
+        if !self.valid() {
+            return None;
+        }
+        self.inner.key().map(|k| k.as_array())
+    }
+
+    fn value(&self) -> Option<Entry<&[u8]>> {
+        if !self.valid() {
+            return None;
+        }
+        self.inner.value().map(|v| v.into())
     }
 }

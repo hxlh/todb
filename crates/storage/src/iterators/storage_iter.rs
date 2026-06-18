@@ -6,49 +6,69 @@ pub trait AsArray<'a> {
     fn as_array(&self) -> &'a [u8];
 }
 
-/// Forward scan iterator.
+/// Shared GAT type declarations only — no methods.
 ///
-/// `Key` and `Value` are declared here only — [`ReverseIter`] and
-/// [`StorageIter`] inherit them via the supertrait chain.
-pub trait ForwardIter {
+/// `valid/key/value` **cannot** live here: `fn key(&self) -> Option<Self::Key<'_>>`
+/// forces `where Self: 'a` on the GAT in edition 2024 (rust issue #87479), which
+/// cascades E0309/E0311 to every generic type parameter. The methods live one
+/// level down on [`IterRead`] so the GAT stays free of the `where Self: 'a` bound.
+pub trait IterBase {
     type Key<'a>: Ord;
-    type Value<'a>
-    where
-        Self: 'a;
-
-    fn seek_to_first(&mut self) -> StorageResult<()>;
-    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()>;
-    fn next(&mut self) -> StorageResult<()>;
+    type Value<'a>;
 }
 
-/// Reverse scan iterator. Inherits `Key`/`Value` from [`ForwardIter`].
-pub trait ReverseIter: ForwardIter {
-    fn seek_to_last(&mut self) -> StorageResult<()>;
-    fn seek_for_prev(&mut self, target: &Self::Key<'_>) -> StorageResult<()>;  // position at last key <= target
-    fn prev(&mut self) -> StorageResult<()>;                                     // move backward
-}
-
-/// Bidirectional storage iterator: forward + reverse + state queries.
+/// State-query methods shared by both scan directions.
 ///
-/// A single iterator instance must not interleave directions (matches
-/// RocksDB MergingIterator semantics). Start a forward scan with
-/// `seek_to_first` or `seek`, a reverse scan with `seek_to_last` or
-/// `seek_for_prev`.
-pub trait StorageIter: ReverseIter {
+/// Lives on its own trait (not on [`IterBase`]) to keep the GAT declarations
+/// separate from the methods that return them — this is what avoids the
+/// `where Self: 'a` cascade. [`ForwardIter`] and [`ReverseIter`] both inherit
+/// these methods via the supertrait chain.
+pub trait IterRead: IterBase {
     fn valid(&self) -> bool;
     fn key(&self) -> Option<Self::Key<'_>>;
     fn value(&self) -> Option<Self::Value<'_>>;
 }
 
+/// Forward scan iterator.
+///
+/// `next()` moves toward larger keys.
+pub trait ForwardIter: IterRead {
+    fn seek_to_first(&mut self) -> StorageResult<()>;
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()>;
+    fn next(&mut self) -> StorageResult<()>;
+}
+
+/// Reverse scan iterator — sibling of [`ForwardIter`].
+///
+/// Same method names but mirrored: `seek_to_first` positions at the largest
+/// key, `seek` positions at the last key ≤ target, and `next()` moves toward
+/// smaller keys.
+pub trait ReverseIter: IterRead {
+    fn seek_to_first(&mut self) -> StorageResult<()>;
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()>;
+    fn next(&mut self) -> StorageResult<()>;
+}
+
 /// Abstracts the format of an index block.
 /// Implementations yield (key, Position) pairs from raw block bytes.
 /// Different index formats (B+tree node, prefix-compressed, etc.) implement this.
-pub trait IndexBlockIter: StorageIter + Sized {
-    fn from_block(block: Bytes) -> StorageResult<Self>;
+pub trait IndexBlockIter: IterRead {
+    fn from_block(block: Bytes) -> StorageResult<Self>
+    where
+        Self: Sized;
+
+    /// Position at the first key >= target (lower bound).
+    ///
+    /// Locates the child block containing `target`. Direction-agnostic: both
+    /// forward and reverse scans call this to find the block, then traverse
+    /// within it via [`ForwardIter`] / [`ReverseIter`].
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()>;
 }
 
 /// Abstracts the format of a data block.
 /// Implementations yield (key, value) pairs from raw block bytes.
-pub trait DataBlockIter: StorageIter + Sized {
-    fn from_block(block: Bytes) -> StorageResult<Self>;
+pub trait DataBlockIter: IterBase {
+    fn from_block(block: Bytes) -> StorageResult<Self>
+    where
+        Self: Sized;
 }

@@ -5,7 +5,7 @@ use bytes::Bytes;
 use crate::{
     block::{InMemoryBlockReader, InMemoryBlockWriter},
     builder::{DefaultSstWriter, SstBuilder, SstFooter, SstOption},
-    iterators::{storage_iter::StorageIter, sst_iter::SstIter},
+    iterators::{storage_iter::{ForwardIter, IterRead}, sst_iter::SstIter},
 };
 
 pub fn make_key(i: u64) -> Bytes {
@@ -41,7 +41,7 @@ pub fn build_sst(n: u64, block_size: usize) -> (Vec<u8>, SstFooter, SstOption) {
 }
 
 /// Collect all keys from an iterator into a Vec<u64>.
-pub fn collect_keys<I: StorageIter>(iter: &mut I) -> Vec<u64>
+pub fn collect_keys<I: ForwardIter>(iter: &mut I) -> Vec<u64>
 where
     for<'a> I::Key<'a>: AsRef<[u8]>,
 {

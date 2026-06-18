@@ -1,7 +1,6 @@
 use crate::{
     block::InMemoryBlockReader,
-    iterators::{concat_iter::ConcatIter, storage_iter::{ForwardIter, StorageIter}, sst_iter::SstIter},
-    row_key::RowKey,
+    iterators::{concat_iter::ConcatIter, storage_iter::{ForwardIter, IterRead}, sst_iter::SstIter},
 };
 
 use super::helpers::{make_key, make_sst_iter};

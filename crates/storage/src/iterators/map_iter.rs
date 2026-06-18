@@ -1,6 +1,6 @@
-use crate::{errors::StorageResult, iterators::storage_iter::{ForwardIter, ReverseIter, StorageIter}};
+use crate::{errors::StorageResult, iterators::storage_iter::{ForwardIter, IterBase, IterRead, ReverseIter}};
 
-/// Extension of [`StorageIter`] that defines how an iterator's native
+/// Extension of [`IterBase`] that defines how an iterator's native
 /// key/value types are exposed to merge layers.
 ///
 /// Most iterators implement this as an *identity* mapping (native types
@@ -20,7 +20,7 @@ use crate::{errors::StorageResult, iterators::storage_iter::{ForwardIter, Revers
 /// lifetime, so it could not represent `RowKey<'a>`. GAT hides the
 /// lifetime inside the associated type, keeping `MapIter` itself
 /// `'static` (required by `TwoMergeIter`'s HRTB bounds).
-pub trait MappedStorageIter: StorageIter + 'static {
+pub trait MappedStorageIter: IterRead + 'static {
     type MappedKey<'a>: Ord
     where
         Self: 'a;
@@ -39,7 +39,7 @@ pub trait MappedStorageIter: StorageIter + 'static {
 ///
 /// Like `Option::map` — purely generic. The concrete mapped types are
 /// determined by the inner iterator's `MappedStorageIter` implementation.
-pub struct MapIter<I: MappedStorageIter> {
+pub struct MapIter<I> {
     inner: I,
 }
 
@@ -48,41 +48,12 @@ impl<I: MappedStorageIter> MapIter<I> {
         Self { inner }
     }
 }
-
-impl<I: MappedStorageIter> ForwardIter for MapIter<I> {
+impl<I: MappedStorageIter> IterBase for MapIter<I> {
     type Key<'a> = I::MappedKey<'a>;
-    type Value<'a> = I::MappedValue<'a>
-    where
-        Self: 'a;
-
-    fn seek_to_first(&mut self) -> StorageResult<()> {
-        self.inner.seek_to_first()
-    }
-
-    fn seek<'a>(&mut self, target: &Self::Key<'a>) -> StorageResult<()> {
-        self.inner.seek_mapped(target)
-    }
-
-    fn next(&mut self) -> StorageResult<()> {
-        self.inner.next()
-    }
+    type Value<'a> = I::MappedValue<'a>;
 }
 
-impl<I: MappedStorageIter> ReverseIter for MapIter<I> {
-    fn seek_to_last(&mut self) -> StorageResult<()> {
-        self.inner.seek_to_last()
-    }
-
-    fn seek_for_prev(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
-        self.inner.seek_mapped_for_prev(target)
-    }
-
-    fn prev(&mut self) -> StorageResult<()> {
-        self.inner.prev()
-    }
-}
-
-impl<I: MappedStorageIter> StorageIter for MapIter<I> {
+impl<I: MappedStorageIter> IterRead for MapIter<I> {
     fn valid(&self) -> bool {
         self.inner.valid()
     }
@@ -95,3 +66,32 @@ impl<I: MappedStorageIter> StorageIter for MapIter<I> {
         self.inner.value().map(I::map_value)
     }
 }
+
+impl<I: MappedStorageIter + ForwardIter> ForwardIter for MapIter<I> {
+    fn seek_to_first(&mut self) -> StorageResult<()> {
+        self.inner.seek_to_first()
+    }
+
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+        self.inner.seek_mapped(target)
+    }
+
+    fn next(&mut self) -> StorageResult<()> {
+        self.inner.next()
+    }
+}
+
+impl<I: MappedStorageIter + ReverseIter> ReverseIter for MapIter<I> {
+    fn seek_to_first(&mut self) -> StorageResult<()> {
+        self.inner.seek_to_first()
+    }
+
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+        self.inner.seek_mapped_for_prev(target)
+    }
+
+    fn next(&mut self) -> StorageResult<()> {
+        self.inner.next()
+    }
+}
+

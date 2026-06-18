@@ -63,10 +63,11 @@ impl StorageLayer {
         &self,
         table_name: &str,
         range: (Bound<Bytes>, Bound<Bytes>),
+        reverse: bool,
     ) -> StorageResult<Box<dyn ScanIter>> {
         let shard_id = self.meta.shard_for(table_name)?;
         let engine = self.acquire_engine(shard_id)?;
-        engine.scan(range)
+        engine.scan(range, reverse)
     }
 
     /// Look up the engine for a shard, cloning the Arc to release the DashMap

@@ -1,7 +1,7 @@
 use crate::{
     block::Position,
     errors::{StorageError, StorageResult},
-    iterators::storage_iter::{AsArray, ForwardIter, ReverseIter, StorageIter},
+    iterators::storage_iter::{AsArray, ForwardIter, IndexBlockIter, IterBase, IterRead, ReverseIter},
 };
 
 const INDEX_VALUE_VERSION: u8 = 1;
@@ -48,77 +48,16 @@ impl<I> IndexEntryDecodeIter<I> {
     }
 }
 
-impl<I> IndexEntryDecodeIter<I>
+impl<I: IterBase> IterBase for IndexEntryDecodeIter<I>
 where
-    I: StorageIter,
-    for<'a> I::Value<'a>: AsArray<'a>,
-{
-    fn refresh_current(&mut self) -> StorageResult<()> {
-        if !self.input.valid() {
-            self.header = None;
-            return Ok(());
-        }
-
-        let value = self.input.value().ok_or_else(|| {
-            StorageError::InvalidValue("valid iterator has no index entry value".into())
-        })?;
-        self.header = Some(self.decode_header(value.as_array())?);
-        Ok(())
-    }
-}
-
-impl<I> ForwardIter for IndexEntryDecodeIter<I>
-where
-    I: StorageIter,
     for<'a> I::Value<'a>: AsArray<'a>,
 {
     type Key<'a> = I::Key<'a>;
-
-    type Value<'a>
-        = IndexEntryValue<'a>
-    where
-        Self: 'a;
-
-    fn seek_to_first(&mut self) -> StorageResult<()> {
-        self.input.seek_to_first()?;
-        self.refresh_current()
-    }
-
-    fn seek<'a>(&mut self, target: &Self::Key<'a>) -> StorageResult<()> {
-        self.input.seek(target)?;
-        self.refresh_current()
-    }
-
-    fn next(&mut self) -> StorageResult<()> {
-        self.input.next()?;
-        self.refresh_current()
-    }
+    type Value<'a> = IndexEntryValue<'a>;
 }
 
-impl<I> ReverseIter for IndexEntryDecodeIter<I>
+impl<I: IterRead> IterRead for IndexEntryDecodeIter<I>
 where
-    I: StorageIter,
-    for<'a> I::Value<'a>: AsArray<'a>,
-{
-    fn seek_to_last(&mut self) -> StorageResult<()> {
-        self.input.seek_to_last()?;
-        self.refresh_current()
-    }
-
-    fn seek_for_prev(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
-        self.input.seek_for_prev(target)?;
-        self.refresh_current()
-    }
-
-    fn prev(&mut self) -> StorageResult<()> {
-        self.input.prev()?;
-        self.refresh_current()
-    }
-}
-
-impl<I> StorageIter for IndexEntryDecodeIter<I>
-where
-    I: StorageIter,
     for<'a> I::Value<'a>: AsArray<'a>,
 {
     fn valid(&self) -> bool {
@@ -139,6 +78,86 @@ where
         Some(IndexEntryValue {
             buf: &value.as_array()[header.payload_start..],
         })
+    }
+}
+
+// ── Shared helpers (direction-agnostic) ──
+
+impl<I: IterRead> IndexEntryDecodeIter<I>
+where
+    for<'a> I::Value<'a>: AsArray<'a>,
+{
+    /// Decode the header for the entry the input currently points at.
+    /// Shared by forward and reverse paths — it only reads value/valid,
+    /// not direction.
+    fn refresh(&mut self) -> StorageResult<()> {
+        if !self.input.valid() {
+            self.header = None;
+            return Ok(());
+        }
+
+        let value = self.input.value().ok_or_else(|| {
+            StorageError::InvalidValue("valid iterator has no index entry value".into())
+        })?;
+        self.header = Some(self.decode_header(value.as_array())?);
+        Ok(())
+    }
+
+    /// Direction-agnostic positioning (lower bound) for index-tree
+    /// navigation. Used by `IndexTreeIter::locate` regardless of scan
+    /// direction; in-block traversal still goes through Forward/ReverseIter.
+    pub(crate) fn seek_lower_bound(&mut self, target: &I::Key<'_>) -> StorageResult<()>
+    where
+        I: IndexBlockIter,
+    {
+        self.input.seek(target)?;
+        self.refresh()
+    }
+}
+
+// ── Forward direction ──
+
+impl<I> ForwardIter for IndexEntryDecodeIter<I>
+where
+    I: ForwardIter,
+    for<'a> I::Value<'a>: AsArray<'a>,
+{
+    fn seek_to_first(&mut self) -> StorageResult<()> {
+        self.input.seek_to_first()?;
+        self.refresh()
+    }
+
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+        self.input.seek(target)?;
+        self.refresh()
+    }
+
+    fn next(&mut self) -> StorageResult<()> {
+        self.input.next()?;
+        self.refresh()
+    }
+}
+
+// ── Reverse direction ──
+
+impl<I> ReverseIter for IndexEntryDecodeIter<I>
+where
+    I: ReverseIter,
+    for<'a> I::Value<'a>: AsArray<'a>,
+{
+    fn seek_to_first(&mut self) -> StorageResult<()> {
+        self.input.seek_to_first()?;
+        self.refresh()
+    }
+
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+        self.input.seek(target)?;
+        self.refresh()
+    }
+
+    fn next(&mut self) -> StorageResult<()> {
+        self.input.next()?;
+        self.refresh()
     }
 }
 
@@ -173,7 +192,7 @@ mod tests {
         block::Position,
         iterators::{
             block_iter::RawEntry,
-            storage_iter::StorageIter,
+            storage_iter::{ForwardIter, IterBase, IterRead, ReverseIter},
         },
     };
 
@@ -191,13 +210,27 @@ mod tests {
         }
     }
 
-    impl ForwardIter for VecEntryIter {
+    impl IterBase for VecEntryIter {
         type Key<'a> = &'a [u8];
-        type Value<'a>
-            = RawEntry<'a>
-        where
-            Self: 'a;
+        type Value<'a> = RawEntry<'a>;
+    }
 
+    impl IterRead for VecEntryIter {
+        fn valid(&self) -> bool {
+            self.pos < self.entries.len()
+        }
+
+        fn key(&self) -> Option<Self::Key<'_>> {
+            self.valid().then_some(self.entries[self.pos].0)
+        }
+
+        fn value(&self) -> Option<Self::Value<'_>> {
+            self.valid()
+                .then_some(RawEntry::from(self.entries[self.pos].1))
+        }
+    }
+
+    impl ForwardIter for VecEntryIter {
         fn seek_to_first(&mut self) -> crate::errors::StorageResult<()> {
             self.pos = if self.entries.is_empty() {
                 usize::MAX
@@ -227,7 +260,7 @@ mod tests {
     }
 
     impl ReverseIter for VecEntryIter {
-        fn seek_to_last(&mut self) -> crate::errors::StorageResult<()> {
+        fn seek_to_first(&mut self) -> crate::errors::StorageResult<()> {
             self.pos = if self.entries.is_empty() {
                 usize::MAX
             } else {
@@ -236,38 +269,19 @@ mod tests {
             Ok(())
         }
 
-        fn seek_for_prev(&mut self, target: &Self::Key<'_>) -> crate::errors::StorageResult<()> {
+        fn seek<'a>(&mut self, target: &Self::Key<'a>) -> crate::errors::StorageResult<()> {
             let upper = self.entries.partition_point(|(key, _)| key <= target);
-            self.pos = if upper == 0 {
-                usize::MAX
-            } else {
-                upper - 1
-            };
+            self.pos = if upper == 0 { usize::MAX } else { upper - 1 };
             Ok(())
         }
 
-        fn prev(&mut self) -> crate::errors::StorageResult<()> {
+        fn next(&mut self) -> crate::errors::StorageResult<()> {
             if self.pos == 0 {
                 self.pos = usize::MAX;
             } else if self.pos < self.entries.len() {
                 self.pos -= 1;
             }
             Ok(())
-        }
-    }
-
-    impl StorageIter for VecEntryIter {
-        fn valid(&self) -> bool {
-            self.pos < self.entries.len()
-        }
-
-        fn key(&self) -> Option<Self::Key<'_>> {
-            self.valid().then_some(self.entries[self.pos].0)
-        }
-
-        fn value(&self) -> Option<Self::Value<'_>> {
-            self.valid()
-                .then_some(RawEntry::from(self.entries[self.pos].1))
         }
     }
 
@@ -283,7 +297,7 @@ mod tests {
         let input = VecEntryIter::new(vec![(b"k1", Box::leak(first.into_boxed_slice()))]);
         let mut iter = IndexEntryDecodeIter::new(input);
 
-        iter.seek_to_first().unwrap();
+        ForwardIter::seek_to_first(&mut iter).unwrap();
 
         assert!(iter.valid());
         assert_eq!(iter.key().unwrap(), b"k1" as &[u8]);
@@ -300,7 +314,7 @@ mod tests {
         ]);
         let mut iter = IndexEntryDecodeIter::new(input);
 
-        iter.seek(&&b"k2"[..]).unwrap();
+        ForwardIter::seek(&mut iter, &&b"k2"[..]).unwrap();
 
         assert!(iter.valid());
         assert_eq!(Position::from(iter.value().unwrap()).offset, 0x20);
@@ -311,7 +325,7 @@ mod tests {
         let input = VecEntryIter::new(vec![(b"k1", b"\x02abcdefgh")]);
         let mut iter = IndexEntryDecodeIter::new(input);
 
-        assert!(iter.seek_to_first().is_err());
+        assert!(ForwardIter::seek_to_first(&mut iter).is_err());
     }
 
     #[test]
@@ -319,6 +333,6 @@ mod tests {
         let input = VecEntryIter::new(vec![(b"k1", b"\x01abc")]);
         let mut iter = IndexEntryDecodeIter::new(input);
 
-        assert!(iter.seek_to_first().is_err());
+        assert!(ForwardIter::seek_to_first(&mut iter).is_err());
     }
 }

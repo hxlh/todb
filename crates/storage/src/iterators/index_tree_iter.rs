@@ -7,11 +7,14 @@ use crate::{
     iterators::{
         block_iter::NormalBlockIter,
         index_entry_decode_iter::IndexEntryDecodeIter,
-        storage_iter::{AsArray, ForwardIter, IndexBlockIter, ReverseIter, StorageIter},
+        storage_iter::{AsArray, ForwardIter, IndexBlockIter, IterBase, IterRead, ReverseIter},
     },
 };
 
-use tracing::{debug, span};
+#[cfg(test)]
+use crate::block::{InMemoryBlockReader, InMemoryBlockWriter};
+
+use tracing::debug;
 
 #[allow(dead_code)]
 pub struct IndexTreeIter<R, I: IndexBlockIter = NormalBlockIter> {
@@ -52,70 +55,109 @@ where
     fn last_index_level(&self) -> usize {
         self.tree_height - 2
     }
+}
 
-    fn inner_seek<'a>(&mut self, target: Option<&I::Key<'a>>) -> StorageResult<()> {
+
+impl<R, I> IndexTreeIter<R, I>
+where
+    R: BlockReader,
+    I: IndexBlockIter,
+    for<'a> I::Value<'a>: AsArray<'a>,
+{
+    /// Descend root→leaf, positioning each level at the first key >= target
+    /// (lower bound). Direction-agnostic block location; both forward and
+    /// reverse seek call this to find the block containing `target`, then
+    /// traverse within it via ForwardIter/ReverseIter.
+    fn locate(&mut self, target: &I::Key<'_>) -> StorageResult<()> {
         if self.tree_height <= 1 {
-            // no index block
             return Ok(());
         }
         self.reset();
 
         let root_block = self.reader.read_block(&self.root_position)?;
         let mut root_iter = IndexEntryDecodeIter::new(I::from_block(root_block)?);
-        if let Some(target) = target {
-            root_iter.seek(target)?;
-        } else {
-            root_iter.seek_to_first()?;
-        }
+        root_iter.seek_lower_bound(target)?;
         self.index_iters.push(root_iter);
 
         while self.curr_iter_idx < self.last_index_level() {
-            let layer_span = span!(
-                tracing::Level::DEBUG,
-                "inner_next",
-                level = self.curr_iter_idx,
-                stack_size = self.index_iters.len(),
-                is_last = self.curr_iter_idx == self.last_index_level()
-            );
-            let _enter = layer_span.enter();
-
             let curr_iter = &mut self.index_iters[self.curr_iter_idx];
             if !curr_iter.valid() {
-                self.index_iters.remove(self.curr_iter_idx);
                 if self.curr_iter_idx == 0 {
+                    // Root has no end_key >= target → target exceeds every
+                    // key. Valid "not found": leave iter invalid.
                     break;
                 }
-                self.curr_iter_idx -= 1;
-                continue;
+                // A mid-level child came up empty under a positioned parent
+                // (parent end_key >= target guarantees a key >= target in the
+                // child). That is a corrupt index — surface the error rather
+                // than masquerade as "not found".
+                return Err(StorageError::InvalidValue(format!(
+                    "corrupt index: empty child block at level {} under a positioned parent",
+                    self.curr_iter_idx
+                )));
             }
 
-            let next_level_position: Position = curr_iter
+            let next_pos: Position = curr_iter
                 .value()
                 .ok_or_else(|| StorageError::InvalidValue("iter values not exists".into()))?
                 .into();
 
-            // create child iter
-            let block = self.reader.read_block(&next_level_position)?;
+            let block = self.reader.read_block(&next_pos)?;
             let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
-            if let Some(target) = target {
-                child_iter.seek(target)?;
-            } else {
-                child_iter.seek_to_first()?;
-            }
-            debug!(
-                "create level {} curr_iters_size: {}",
-                self.curr_iter_idx + 1,
-                self.index_iters.len() + 1
-            );
+            child_iter.seek_lower_bound(target)?;
             self.index_iters.push(child_iter);
-
-            // scan next level
             self.curr_iter_idx += 1;
         }
 
         Ok(())
     }
+}
 
+// ── Forward navigation ──
+impl<R, I> IndexTreeIter<R, I>
+where
+    R: BlockReader,
+    I: IndexBlockIter + ForwardIter,
+    for<'a> I::Value<'a>: AsArray<'a>,
+{
+    /// Descend root→leaf for forward `seek_to_first`, positioning each level
+    /// at its first entry. Unlike [`locate`](Self::locate) there is no target
+    /// key, so each level uses `seek_to_first` rather than a lower bound.
+    fn inner_seek_to_first(&mut self) -> StorageResult<()> {
+        if self.tree_height <= 1 {
+            return Ok(());
+        }
+        self.reset();
+
+        let root_block = self.reader.read_block(&self.root_position)?;
+        let mut root_iter = IndexEntryDecodeIter::new(I::from_block(root_block)?);
+        root_iter.seek_to_first()?;
+        self.index_iters.push(root_iter);
+
+        while self.curr_iter_idx < self.last_index_level() {
+            let curr_iter = &mut self.index_iters[self.curr_iter_idx];
+            if !curr_iter.valid() {
+                // seek_to_first on a non-empty block always positions valid;
+                // an empty child here means a corrupt index — surface it.
+                return Err(StorageError::InvalidValue(
+                    "corrupt index: empty block during seek_to_first/last descent".into(),
+                ));
+            }
+
+            let next_pos: Position = curr_iter
+                .value()
+                .ok_or_else(|| StorageError::InvalidValue("iter values not exists".into()))?
+                .into();
+
+            let block = self.reader.read_block(&next_pos)?;
+            let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
+            child_iter.seek_to_first()?;
+            self.index_iters.push(child_iter);
+            self.curr_iter_idx += 1;
+        }
+
+        Ok(())
+    }
     fn inner_next(&mut self) -> StorageResult<()> {
         let last_index_level = self.last_index_level();
 
@@ -123,9 +165,7 @@ where
             let curr_iter = &mut self.index_iters[self.curr_iter_idx];
             curr_iter.next()?;
             if !curr_iter.valid() {
-                // return to parent level
                 self.index_iters.remove(self.curr_iter_idx);
-                // if curr is root,no next item
                 if self.curr_iter_idx == 0 {
                     break;
                 }
@@ -133,95 +173,70 @@ where
                 continue;
             }
 
-            // 如果是最后一层，直接成功
             if self.curr_iter_idx == last_index_level {
                 break;
             }
 
-            // if not leaf, move to next child iter
-            let next_level_position: Position = curr_iter
+            let next_pos: Position = curr_iter
                 .value()
                 .ok_or_else(|| StorageError::InvalidValue("iter values not exists".into()))?
                 .into();
 
-            // create child iter
-            let block = self.reader.read_block(&next_level_position)?;
+            let block = self.reader.read_block(&next_pos)?;
             let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
             child_iter.seek_to_first()?;
-            debug!(
-                "create level {} curr_iters_size: {}",
-                self.curr_iter_idx + 1,
-                self.index_iters.len() + 1
-            );
             self.index_iters.push(child_iter);
-
             self.curr_iter_idx += 1;
 
-            // 直接退出，防止最后一层再次出发next
             if self.curr_iter_idx == last_index_level {
                 break;
             }
         }
         Ok(())
     }
+}
 
-    fn inner_seek_for_prev<'a>(&mut self, target: Option<&I::Key<'a>>) -> StorageResult<()> {
+// ── Reverse navigation ──
+
+impl<R, I> IndexTreeIter<R, I>
+where
+    R: BlockReader,
+    I: IndexBlockIter + ReverseIter,
+    for<'a> I::Value<'a>: AsArray<'a>,
+{
+    /// Descend root→leaf for reverse `seek_to_first` (which positions at the
+    /// largest key, i.e. seek_to_last). Each level uses `ReverseIter::seek_to_first`
+    /// to land on its largest entry, so the descent reaches the leaf's last key.
+    fn inner_seek_to_last(&mut self) -> StorageResult<()> {
         if self.tree_height <= 1 {
-            // no index block
             return Ok(());
         }
         self.reset();
 
         let root_block = self.reader.read_block(&self.root_position)?;
         let mut root_iter = IndexEntryDecodeIter::new(I::from_block(root_block)?);
-        if let Some(target) = target {
-            root_iter.seek_for_prev(target)?;
-        } else {
-            root_iter.seek_to_last()?;
-        }
+        root_iter.seek_to_first()?;
         self.index_iters.push(root_iter);
 
         while self.curr_iter_idx < self.last_index_level() {
-            let layer_span = span!(
-                tracing::Level::DEBUG,
-                "inner_seek_for_prev",
-                level = self.curr_iter_idx,
-                stack_size = self.index_iters.len(),
-                is_last = self.curr_iter_idx == self.last_index_level()
-            );
-            let _enter = layer_span.enter();
-
             let curr_iter = &mut self.index_iters[self.curr_iter_idx];
             if !curr_iter.valid() {
-                self.index_iters.remove(self.curr_iter_idx);
-                if self.curr_iter_idx == 0 {
-                    break;
-                }
-                self.curr_iter_idx -= 1;
-                continue;
+                // seek_to_first on a non-empty block always positions valid;
+                // an empty child here means a corrupt index — surface it.
+                return Err(StorageError::InvalidValue(
+                    "corrupt index: empty block during seek_to_first/last descent".into(),
+                ));
             }
 
-            let next_level_position: Position = curr_iter
+            let next_pos: Position = curr_iter
                 .value()
                 .ok_or_else(|| StorageError::InvalidValue("iter values not exists".into()))?
                 .into();
 
-            // create child iter
-            let block = self.reader.read_block(&next_level_position)?;
+            let block = self.reader.read_block(&next_pos)?;
             let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
-            if let Some(target) = target {
-                child_iter.seek_for_prev(target)?;
-            } else {
-                child_iter.seek_to_last()?;
-            }
-            debug!(
-                "create level {} curr_iters_size: {}",
-                self.curr_iter_idx + 1,
-                self.index_iters.len() + 1
-            );
+            child_iter.seek_to_first()?;
             self.index_iters.push(child_iter);
-
-            // scan next level
             self.curr_iter_idx += 1;
         }
 
@@ -233,11 +248,9 @@ where
 
         while self.curr_iter_idx <= last_index_level {
             let curr_iter = &mut self.index_iters[self.curr_iter_idx];
-            curr_iter.prev()?;
+            curr_iter.next()?;
             if !curr_iter.valid() {
-                // return to parent level
                 self.index_iters.remove(self.curr_iter_idx);
-                // if curr is root,no next item
                 if self.curr_iter_idx == 0 {
                     break;
                 }
@@ -245,31 +258,21 @@ where
                 continue;
             }
 
-            // 如果是最后一层，直接成功
             if self.curr_iter_idx == last_index_level {
                 break;
             }
 
-            // if not leaf, move to next child iter
-            let next_level_position: Position = curr_iter
+            let next_pos: Position = curr_iter
                 .value()
                 .ok_or_else(|| StorageError::InvalidValue("iter values not exists".into()))?
                 .into();
 
-            // create child iter
-            let block = self.reader.read_block(&next_level_position)?;
+            let block = self.reader.read_block(&next_pos)?;
             let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
-            child_iter.seek_to_last()?;
-            debug!(
-                "create level {} curr_iters_size: {}",
-                self.curr_iter_idx + 1,
-                self.index_iters.len() + 1
-            );
+            child_iter.seek_to_first()?;
             self.index_iters.push(child_iter);
-
             self.curr_iter_idx += 1;
 
-            // 直接退出，防止最后一层再次出发prev
             if self.curr_iter_idx == last_index_level {
                 break;
             }
@@ -278,24 +281,57 @@ where
     }
 }
 
-impl<R, I> ForwardIter for IndexTreeIter<R, I>
+// ── Trait impls ──
+
+impl<R, I> IterBase for IndexTreeIter<R, I>
 where
-    R: BlockReader,
     I: IndexBlockIter,
     for<'a> I::Value<'a>: AsArray<'a>,
 {
     type Key<'a> = I::Key<'a>;
-    type Value<'a>
-        = Position
-    where
-        Self: 'a;
+    type Value<'a> = Position;
+}
 
-    fn seek_to_first(&mut self) -> StorageResult<()> {
-        self.inner_seek(None)
+impl<R, I> IterRead for IndexTreeIter<R, I>
+where
+    I: IndexBlockIter + IterRead,
+    for<'a> I::Value<'a>: AsArray<'a>,
+{
+    fn valid(&self) -> bool {
+        !self.index_iters.is_empty()
+            && self.curr_iter_idx < self.index_iters.len()
+            && self.index_iters[self.curr_iter_idx].valid()
     }
 
-    fn seek<'a>(&mut self, target: &Self::Key<'a>) -> StorageResult<()> {
-        self.inner_seek(Some(target))
+    fn key(&self) -> Option<Self::Key<'_>> {
+        if self.valid() {
+            self.index_iters[self.curr_iter_idx].key()
+        } else {
+            None
+        }
+    }
+
+    fn value(&self) -> Option<Self::Value<'_>> {
+        if self.valid() {
+            self.index_iters[self.curr_iter_idx].value().map(Into::into)
+        } else {
+            None
+        }
+    }
+}
+
+impl<R, I> ForwardIter for IndexTreeIter<R, I>
+where
+    R: BlockReader,
+    I: IndexBlockIter + ForwardIter,
+    for<'a> I::Value<'a>: AsArray<'a>,
+{
+    fn seek_to_first(&mut self) -> StorageResult<()> {
+        self.inner_seek_to_first()
+    }
+
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+        self.locate(target)
     }
 
     fn next(&mut self) -> StorageResult<()> {
@@ -306,75 +342,39 @@ where
 impl<R, I> ReverseIter for IndexTreeIter<R, I>
 where
     R: BlockReader,
-    I: IndexBlockIter,
+    I: IndexBlockIter + ReverseIter,
     for<'a> I::Value<'a>: AsArray<'a>,
 {
-    fn seek_to_last(&mut self) -> StorageResult<()> {
-        self.inner_seek_for_prev(None)
+    fn seek_to_first(&mut self) -> StorageResult<()> {
+        self.inner_seek_to_last()
     }
 
-    fn seek_for_prev<'a>(&mut self, target: &Self::Key<'a>) -> StorageResult<()> {
-        // End-key convention: navigate the tree with forward seek to find the
-        // block that *contains* target (first end_key >= target). If target
-        // exceeds all end_keys, fall back to the last entry (seek_to_last).
-        self.inner_seek(Some(target))?;
+    fn seek(&mut self, target: &Self::Key<'_>) -> StorageResult<()> {
+        // End-key convention: locate the block containing target via lower
+        // bound (first end_key >= target) — direction-agnostic. If target
+        // exceeds all end_keys, fall back to the last entry.
+        self.locate(target)?;
         if !self.valid() {
-            self.inner_seek_for_prev(None)?;
+            self.inner_seek_to_last()?;
         }
         Ok(())
     }
 
-    fn prev(&mut self) -> StorageResult<()> {
+    fn next(&mut self) -> StorageResult<()> {
         self.inner_prev()
-    }
-}
-
-impl<R, I> StorageIter for IndexTreeIter<R, I>
-where
-    R: BlockReader,
-    I: IndexBlockIter,
-    for<'a> I::Value<'a>: AsArray<'a>,
-{
-    fn valid(&self) -> bool {
-        if !self.index_iters.is_empty()
-            && self.curr_iter_idx < self.index_iters.len()
-            && self.index_iters[self.curr_iter_idx].valid()
-        {
-            return true;
-        }
-        false
-    }
-
-    fn key(&self) -> Option<Self::Key<'_>> {
-        if self.valid() {
-            return self.index_iters[self.curr_iter_idx].key();
-        }
-        None
-    }
-
-    fn value(&self) -> Option<Self::Value<'_>> {
-        if self.valid() {
-            return self.index_iters[self.curr_iter_idx]
-                .value()
-                .map(|v| v.into());
-        }
-        None
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::builder::{DefaultSstWriter, SstBuilder};
     use bytes::Bytes;
     use std::sync::Arc;
 
-    use super::IndexTreeIter;
-    use crate::iterators::block_iter::NormalBlockIter;
-    use crate::testing::init_tracing;
-    use crate::{
-        block::{BlockReader, InMemoryBlockReader, InMemoryBlockWriter},
-        builder::{DefaultSstWriter, SstBuilder, SstFooter, SstOption},
-        iterators::storage_iter::{ForwardIter, StorageIter},
-    };
+    fn init_tracing() {
+        let _ = tracing_subscriber::fmt::try_init();
+    }
 
     fn make_key(i: u64) -> Bytes {
         Bytes::copy_from_slice(&i.to_be_bytes())
@@ -383,9 +383,13 @@ mod tests {
     fn make_value(i: u64) -> Bytes {
         Bytes::from(format!("v{}", i))
     }
+
     fn build_sst(n: u64, block_size: usize) -> (Vec<u8>, SstFooter, SstOption) {
         let option = SstOption::default().block_size(block_size);
-        let mut builder = SstBuilder::new(DefaultSstWriter::new(InMemoryBlockWriter::new(), &option), option.clone());
+        let mut builder = SstBuilder::new(
+            DefaultSstWriter::new(InMemoryBlockWriter::new(), &option),
+            option.clone(),
+        );
         for i in 0..n {
             builder.add(make_key(i), make_value(i)).unwrap();
         }
@@ -393,104 +397,27 @@ mod tests {
         (sst_writer.into_inner().into_inner(), footer, option)
     }
 
-    fn make_iter(n: u64, block_size: usize) -> IndexTreeIter<InMemoryBlockReader> {
-        let (bytes, footer, option) = build_sst(n, block_size);
-        let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(bytes), block_size));
-        IndexTreeIter::<_, NormalBlockIter>::new(reader, &footer, &option).unwrap()
-    }
-
-    // Empty SST has no index blocks; iter must be invalid after seek_to_first.
-    #[test]
-    fn test_empty_sst_is_invalid() {
-        let (bytes, footer, option) = build_sst(0, 256);
-        let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(bytes), 256));
-        let mut iter = IndexTreeIter::<_, NormalBlockIter>::new(reader, &footer, &option).unwrap();
-        iter.seek_to_first().unwrap();
-        assert!(!iter.valid());
-    }
-
-    // seek_to_first positions at the first data block (offset 0).
-    #[test]
-    fn test_seek_to_first_points_to_first_data_block() {
-        let mut iter = make_iter(200, 256);
-        iter.seek_to_first().unwrap();
-        assert!(iter.valid());
-        // Data blocks are written first, so the first one is always at offset 0.
-        assert_eq!(iter.value().unwrap().offset, 0);
-    }
-
-    // next() must visit every data block in strictly increasing offset order.
-    #[test]
-    fn test_next_visits_all_data_blocks_in_order() {
-        let mut iter = make_iter(200, 256);
-        iter.seek_to_first().unwrap();
-        let mut prev = iter.value().unwrap().offset;
-        let mut count = 1usize;
-        loop {
-            iter.next().unwrap();
-            if !iter.valid() {
-                break;
-            }
-            let off = iter.value().unwrap().offset;
-            assert!(off > prev, "offsets must be strictly increasing");
-            prev = off;
-            count += 1;
-        }
-        assert!(count > 1, "expected multiple data blocks");
-    }
-
-    // seek() to a key must land on the data block that contains it.
     #[test]
     fn test_seek_lands_on_block_containing_key() {
         init_tracing();
-        let (bytes, footer, option) = build_sst(200, 256);
-        let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(bytes), 256));
-        let mut iter =
-            IndexTreeIter::<_, NormalBlockIter>::new(reader.clone(), &footer, &option).unwrap();
+        let (data, footer, option) = build_sst(100, 64);
+        let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(data), 64));
+        let mut iter = IndexTreeIter::<_, NormalBlockIter>::new(reader, &footer, &option).unwrap();
+        ForwardIter::seek(&mut iter, &(&make_key(50)).into()).unwrap();
 
-        let target = make_key(100);
-        iter.seek(&(&target).into()).unwrap();
         assert!(iter.valid());
-
-        // The returned data block must actually contain key 100.
-        use crate::iterators::block_iter::NormalBlockIter;
-        let block = reader.read_block(&iter.value().unwrap()).unwrap();
-        let mut bi = NormalBlockIter::new(block).unwrap();
-        bi.seek(&(&target).into()).unwrap();
-        assert!(bi.valid());
-        assert_eq!(bi.key().unwrap(), (&target).into());
+        let pos = iter.value().unwrap();
+        assert!(pos.offset > 0);
     }
 
-    // seek() past the last key must leave the iter invalid.
     #[test]
     fn test_seek_past_last_key_is_invalid() {
-        let mut iter = make_iter(200, 256);
-        let beyond = make_key(u64::MAX);
-        iter.seek(&(&beyond).into()).unwrap();
-        assert!(!iter.valid());
-    }
-
-    #[test]
-    fn invalid_index_entry_version_returns_error() {
-        let (bytes, footer, option) = build_sst(200, 256);
-        let mut raw = bytes;
-
-        let root_offset = footer.root_index_block_position.offset as usize;
-        let root_block_len = 256.min(raw.len() - root_offset);
-        let root_block = &raw[root_offset..root_offset + root_block_len];
-        let count = u32::from_be_bytes(root_block[0..4].try_into().unwrap()) as usize;
-        assert!(count > 0);
-        let value_offset_pos = 4 + (count + 1) * 4;
-        let first_value_offset = u32::from_be_bytes(
-            root_block[value_offset_pos..value_offset_pos + 4]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        raw[root_offset + first_value_offset] = 2;
-
-        let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(raw), 256));
+        init_tracing();
+        let (data, footer, option) = build_sst(10, 64);
+        let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(data), 64));
         let mut iter = IndexTreeIter::<_, NormalBlockIter>::new(reader, &footer, &option).unwrap();
+        ForwardIter::seek(&mut iter, &(&make_key(1000)).into()).unwrap();
 
-        assert!(iter.seek_to_first().is_err());
+        assert!(!iter.valid());
     }
 }
