@@ -2,23 +2,25 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::{
     block::FileBlockReader,
-    builder::SstOption,
-    engine::StorageEngine,
+    builder::{DefaultSstWriter, SstBuilder, SstOption},
+    disk_manager::DiskManager,
+    engine::{ShardId, TableStore},
     errors::StorageResult,
     iterators::{
-        map_iter::MapIter,
         concat_iter::ConcatIter,
+        map_iter::MapIter,
         merge_iter::MergeIter,
         scan_iter::ScanIter,
         sst_iter::SstIter,
-        storage_iter::{AsArray, ForwardIter, ReverseIter},
+        storage_iter::{ForwardIter, IterRead},
         two_merge_iter::TwoMergeIter,
     },
-    lsm_state::{LsmOption, LsmState},
+    lsm_iter::{LsmForwardScan, LsmReverseScan},
+    lsm_state::{LevelMeta, LsmState, LsmTableOption, SstMeta},
     memtable::{Entry, MemTable, OwnedMemTableIter},
     write_batch::{WriteBatch, WriteEntry},
 };
@@ -32,22 +34,46 @@ type LnSide = MergeIter<ConcatIter<SstIter<FileBlockReader>>>;
 type SstSide = TwoMergeIter<L0Side, LnSide>;
 type MergedIter = TwoMergeIter<MemSide, SstSide>;
 
-/// LSM-tree storage engine.
-///
-/// State is swapped atomically via `Arc<LsmState>` under a write lock.
-/// Readers clone the Arc and see a consistent snapshot.
+/// Per-shard LSM data container. Slim: holds only `state` (memtable + levels),
+/// a shared `DiskManager` (injected by [`LsmEngine`](crate::lsm_engine::LsmEngine)),
+/// and the table's [`LsmTableOption`]. No flush thread of its own — flush is
+/// scheduled cross-shard by LsmEngine. Implements [`TableStore`].
 pub struct LsmStore {
     state: Arc<RwLock<Arc<LsmState>>>,
-    option: LsmOption,
+    table_option: LsmTableOption,
+    disk_manager: Arc<DiskManager>,
+    shard_id: ShardId,
+    /// Serializes concurrent flush of this shard (write force vs scheduler).
+    flush_lock: Mutex<()>,
 }
 
 impl LsmStore {
-    pub fn new(option: LsmOption) -> Self {
-        std::fs::create_dir_all(&option.data_dir).ok();
+    /// `disk_manager` and `table_option` are injected by LsmEngine at
+    /// `create_shard` time.
+    pub(crate) fn new(
+        table_option: LsmTableOption,
+        disk_manager: Arc<DiskManager>,
+        shard_id: ShardId,
+    ) -> Self {
         Self {
             state: Arc::new(RwLock::new(Arc::new(LsmState::new()))),
-            option,
+            table_option,
+            disk_manager,
+            shard_id,
+            flush_lock: Mutex::new(()),
         }
+    }
+
+    pub fn disk_manager(&self) -> &Arc<DiskManager> {
+        &self.disk_manager
+    }
+
+    pub fn shard_id(&self) -> ShardId {
+        self.shard_id
+    }
+
+    pub fn table_option(&self) -> &LsmTableOption {
+        &self.table_option
     }
 
     /// Read-lock the state and clone the Arc snapshot.
@@ -61,7 +87,7 @@ impl LsmStore {
         let mut guard = self.state.write();
         let old = guard.clone();
 
-        if old.active_mem.estimate_memory() < self.option.memtable_size_limit {
+        if old.active_mem.estimate_memory() < self.table_option.memtable_size_limit {
             // Another thread already switched.
             return;
         }
@@ -76,9 +102,122 @@ impl LsmStore {
             levels: old.levels.clone(),
         });
     }
+
+    /// Build one SST from an immutable memtable; return its meta.
+    fn build_sst_from_memtable(&self, imm: &Arc<MemTable<Bytes, Bytes>>) -> StorageResult<SstMeta> {
+        let writer = self.disk_manager.create_sst()?;
+        let sst_id = writer.sst_id();
+        let opt = SstOption::default().block_size(self.disk_manager.block_size());
+        let mut builder = SstBuilder::new(DefaultSstWriter::new(writer, &opt), opt);
+
+        let map = imm.map_arc();
+        let smallest = map.front().map(|e| e.key().clone()).unwrap_or_default();
+        let largest = map.back().map(|e| e.key().clone()).unwrap_or_default();
+
+        let mut iter = imm.iter();
+        ForwardIter::seek_to_first(&mut iter)?;
+        while iter.valid() {
+            let k = iter.key().unwrap().clone();
+            match iter.value().unwrap() {
+                Entry::Put(v) => builder.add(k, v.clone())?,
+                Entry::Delete => builder.add_delete(k)?,
+            }
+            ForwardIter::next(&mut iter)?;
+        }
+
+        let (_footer, sst_writer) = builder.finish()?;
+        let file_size = sst_writer.into_inner().file_size();
+        Ok(SstMeta {
+            id: sst_id,
+            key_range: (smallest, largest),
+            file_size,
+        })
+    }
+
+    /// Flush the oldest immutable memtable (FIFO) to an SST. Serialized by
+    /// `flush_lock` so the scheduler and write-force cannot flush concurrently.
+    pub fn flush_oldest_imm(&self) -> StorageResult<()> {
+        let _flush_guard = self.flush_lock.lock();
+
+        let oldest = {
+            let state = self.snapshot();
+            match state.imm_memtables.last() {
+                Some(imm) => imm.clone(),
+                None => return Ok(()),
+            }
+        };
+
+        let sst_meta = self.build_sst_from_memtable(&oldest)?;
+
+        let mut guard = self.state.write();
+        let old = guard.clone();
+        let mut new_imms = old.imm_memtables.clone();
+        new_imms.pop(); // remove oldest (last == oldest, front == newest)
+        let mut new_levels = old.levels.clone();
+        if new_levels.is_empty() {
+            new_levels.push(LevelMeta {
+                level: 0,
+                ssts: Vec::new(),
+            });
+        }
+        new_levels[0].ssts.push(sst_meta);
+        *guard = Arc::new(LsmState {
+            active_mem: old.active_mem.clone(),
+            imm_memtables: new_imms,
+            levels: new_levels,
+        });
+        Ok(())
+    }
+
+    /// Compose the full merge iterator over memtable + L0 + Ln SSTs.
+    fn build_merged_iter(&self, state: &LsmState) -> StorageResult<MergedIter> {
+        let block_size = self.disk_manager().block_size();
+
+        let mut mem_iters: Vec<MapIter<OwnedMemTableIter<Bytes, Bytes>>> =
+            vec![MapIter::new(state.active_mem.iter())];
+        for imm in &state.imm_memtables {
+            mem_iters.push(MapIter::new(imm.iter()));
+        }
+        let mem_merge = MergeIter::new(mem_iters);
+
+        let l0_iters: Vec<SstIter<FileBlockReader>> = state
+            .levels
+            .first()
+            .into_iter()
+            .flat_map(|lvl| &lvl.ssts)
+            .map(|sst| {
+                let opened = self.disk_manager().open(sst.id)?;
+                let opt = SstOption::default().block_size(block_size);
+                SstIter::new(Arc::new(opened.reader), opened.footer, opt)
+            })
+            .collect::<StorageResult<_>>()?;
+        let l0_merge = MergeIter::new(l0_iters);
+
+        let ln_iters: Vec<ConcatIter<SstIter<FileBlockReader>>> = state
+            .levels
+            .iter()
+            .skip(1)
+            .map(|level| -> StorageResult<_> {
+                let iters: Vec<_> = level
+                    .ssts
+                    .iter()
+                    .map(|sst| {
+                        let opened = self.disk_manager().open(sst.id)?;
+                        let opt = SstOption::default().block_size(block_size);
+                        SstIter::new(Arc::new(opened.reader), opened.footer, opt)
+                    })
+                    .collect::<StorageResult<_>>()?;
+                Ok(ConcatIter::new(iters))
+            })
+            .collect::<StorageResult<_>>()?;
+        let ln_merge = MergeIter::new(ln_iters);
+
+        let sst_merge = TwoMergeIter::new(l0_merge, ln_merge)?;
+        TwoMergeIter::new(mem_merge, sst_merge)
+    }
 }
 
-impl StorageEngine for LsmStore {
+impl TableStore for LsmStore {
     fn write(&self, batch: WriteBatch) -> StorageResult<()> {
         let need_switch = {
             let state = self.snapshot();
@@ -89,11 +228,16 @@ impl StorageEngine for LsmStore {
                     WriteEntry::Delete { key } => active.delete(key),
                 }
             }
-            active.estimate_memory() >= self.option.memtable_size_limit
+            active.estimate_memory() >= self.table_option.memtable_size_limit
         };
 
         if need_switch {
             self.switch_memtable();
+            // Passive flush: too many immutables piled up -> flush oldest
+            // synchronously to reclaim slots (backpressure on the writer).
+            if self.snapshot().imm_memtables.len() >= self.table_option.max_imm_memtables {
+                self.flush_oldest_imm()?;
+            }
         }
         Ok(())
     }
@@ -115,219 +259,5 @@ impl StorageEngine for LsmStore {
             scan.init()?;
             Ok(Box::new(scan))
         }
-    }
-}
-
-impl LsmStore {
-    fn build_merged_iter(&self, state: &LsmState) -> StorageResult<MergedIter> {
-        let block_size = self.option.block_size;
-
-        let mut mem_iters: Vec<MapIter<OwnedMemTableIter<Bytes, Bytes>>> =
-            vec![MapIter::new(state.active_mem.iter())];
-        for imm in &state.imm_memtables {
-            mem_iters.push(MapIter::new(imm.iter()));
-        }
-        let mem_merge = MergeIter::new(mem_iters);
-
-        let l0_iters: Vec<SstIter<FileBlockReader>> = state
-            .levels
-            .first()
-            .into_iter()
-            .flat_map(|lvl| &lvl.ssts)
-            .map(|sst| {
-                let reader = Arc::new(FileBlockReader::open(&sst.file_path, block_size)?);
-                let opt = SstOption::default().block_size(block_size);
-                SstIter::new(reader, sst.footer, opt)
-            })
-            .collect::<StorageResult<_>>()?;
-        let l0_merge = MergeIter::new(l0_iters);
-
-        let ln_iters: Vec<ConcatIter<SstIter<FileBlockReader>>> = state
-            .levels
-            .iter()
-            .skip(1)
-            .map(|level| -> StorageResult<_> {
-                let iters: Vec<_> = level
-                    .ssts
-                    .iter()
-                    .map(|sst| {
-                        let reader = Arc::new(FileBlockReader::open(&sst.file_path, block_size)?);
-                        let opt = SstOption::default().block_size(block_size);
-                        SstIter::new(reader, sst.footer, opt)
-                    })
-                    .collect::<StorageResult<_>>()?;
-                Ok(ConcatIter::new(iters))
-            })
-            .collect::<StorageResult<_>>()?;
-        let ln_merge = MergeIter::new(ln_iters);
-
-        let sst_merge = TwoMergeIter::new(l0_merge, ln_merge)?;
-        TwoMergeIter::new(mem_merge, sst_merge)
-    }
-}
-
-// ── Forward range-limited scan ──
-
-/// Forward scan: lower bound positions via seek, upper bound enforced in `valid()`.
-pub struct LsmForwardScan<I: ForwardIter> {
-    inner: I,
-    lower: Bound<Bytes>,
-    upper: Bound<Bytes>,
-}
-
-impl<I> LsmForwardScan<I>
-where
-    I: ForwardIter,
-    for<'a> I::Key<'a>: From<&'a [u8]>,
-{
-    fn new(inner: I, lower: Bound<Bytes>, upper: Bound<Bytes>) -> Self {
-        Self { inner, lower, upper }
-    }
-
-    fn init(&mut self) -> StorageResult<()> {
-        match &self.lower {
-            Bound::Included(start) => self.inner.seek(&start.as_ref().into()),
-            Bound::Excluded(start) => {
-                self.inner.seek(&start.as_ref().into())?;
-                while self.inner.valid() {
-                    let is_equal = self.inner.key().map_or(false, |k| k == start.as_ref().into());
-                    if is_equal {
-                        self.inner.next()?;
-                    } else {
-                        break;
-                    }
-                }
-                Ok(())
-            }
-            Bound::Unbounded => self.inner.seek_to_first(),
-        }
-    }
-}
-
-impl<I> ScanIter for LsmForwardScan<I>
-where
-    I: ForwardIter + Send,
-    for<'a> I::Key<'a>: AsArray<'a> + From<&'a [u8]>,
-    for<'a> I::Value<'a>: Into<Entry<&'a [u8]>>,
-{
-    fn valid(&self) -> bool {
-        if !self.inner.valid() {
-            return false;
-        }
-        let key = self.inner.key().unwrap();
-        match &self.upper {
-            Bound::Included(end) => key <= (&end[..]).into(),
-            Bound::Excluded(end) => key < (&end[..]).into(),
-            Bound::Unbounded => true,
-        }
-    }
-
-    fn seek_to_first(&mut self) -> StorageResult<()> {
-        self.inner.seek_to_first()
-    }
-
-    fn seek(&mut self, target: &[u8]) -> StorageResult<()> {
-        self.inner.seek(&target.into())
-    }
-
-    fn next(&mut self) -> StorageResult<()> {
-        self.inner.next()
-    }
-
-    fn key(&self) -> Option<&[u8]> {
-        if !self.valid() {
-            return None;
-        }
-        self.inner.key().map(|k| k.as_array())
-    }
-
-    fn value(&self) -> Option<Entry<&[u8]>> {
-        if !self.valid() {
-            return None;
-        }
-        self.inner.value().map(|v| v.into())
-    }
-}
-
-// ── Reverse range-limited scan ──
-
-/// Reverse scan: upper bound positions via seek, lower bound enforced in `valid()`.
-pub struct LsmReverseScan<I: ReverseIter> {
-    inner: I,
-    lower: Bound<Bytes>,
-    upper: Bound<Bytes>,
-}
-
-impl<I> LsmReverseScan<I>
-where
-    I: ReverseIter,
-    for<'a> I::Key<'a>: From<&'a [u8]>,
-{
-    fn new(inner: I, lower: Bound<Bytes>, upper: Bound<Bytes>) -> Self {
-        Self { inner, lower, upper }
-    }
-
-    fn init(&mut self) -> StorageResult<()> {
-        match &self.upper {
-            Bound::Included(end) => self.inner.seek(&end.as_ref().into()),
-            Bound::Excluded(end) => {
-                self.inner.seek(&end.as_ref().into())?;
-                while self.inner.valid() {
-                    let is_equal = self.inner.key().map_or(false, |k| k == end.as_ref().into());
-                    if is_equal {
-                        self.inner.next()?;
-                    } else {
-                        break;
-                    }
-                }
-                Ok(())
-            }
-            Bound::Unbounded => self.inner.seek_to_first(),
-        }
-    }
-}
-
-impl<I> ScanIter for LsmReverseScan<I>
-where
-    I: ReverseIter + Send,
-    for<'a> I::Key<'a>: AsArray<'a> + From<&'a [u8]>,
-    for<'a> I::Value<'a>: Into<Entry<&'a [u8]>>,
-{
-    fn valid(&self) -> bool {
-        if !self.inner.valid() {
-            return false;
-        }
-        let key = self.inner.key().unwrap();
-        match &self.lower {
-            Bound::Included(start) => key >= (&start[..]).into(),
-            Bound::Excluded(start) => key > (&start[..]).into(),
-            Bound::Unbounded => true,
-        }
-    }
-
-    fn seek_to_first(&mut self) -> StorageResult<()> {
-        self.inner.seek_to_first()
-    }
-
-    fn seek(&mut self, target: &[u8]) -> StorageResult<()> {
-        self.inner.seek(&target.into())
-    }
-
-    fn next(&mut self) -> StorageResult<()> {
-        self.inner.next()
-    }
-
-    fn key(&self) -> Option<&[u8]> {
-        if !self.valid() {
-            return None;
-        }
-        self.inner.key().map(|k| k.as_array())
-    }
-
-    fn value(&self) -> Option<Entry<&[u8]>> {
-        if !self.valid() {
-            return None;
-        }
-        self.inner.value().map(|v| v.into())
     }
 }

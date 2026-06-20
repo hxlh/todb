@@ -78,6 +78,11 @@ impl FileBlockWriter {
             block_size,
         })
     }
+
+    /// Bytes written so far (== current file length).
+    pub fn file_size(&self) -> u64 {
+        self.next_offset
+    }
 }
 
 impl BlockWriter for FileBlockWriter {
@@ -151,6 +156,14 @@ impl FileBlockReader {
             file: std::sync::Arc::new(file),
             block_size,
         })
+    }
+
+    /// Build a reader over an already-opened file (used after reading the footer).
+    pub fn from_file(file: std::fs::File, block_size: usize) -> Self {
+        Self {
+            file: std::sync::Arc::new(file),
+            block_size,
+        }
     }
 }
 

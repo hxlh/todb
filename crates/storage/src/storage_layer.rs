@@ -1,119 +1,92 @@
 use std::ops::Bound;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use tracing::debug;
 
 use crate::{
-    engine::{StorageEngine, DEFAULT_SHARD, ShardId},
+    engine::{ShardId, StorageEngine, TableOption},
     errors::{StorageError, StorageResult},
     iterators::ScanIter,
-    lsm_store::LsmStore,
-    lsm_state::LsmOption,
+    lsm_engine::LsmEngine,
+    lsm_state::LsmEngineOption,
     write_batch::WriteBatch,
 };
 
-/// Global storage singleton. Routes table-level requests to shards.
-///
-/// Table → shard routing lives here (via [`MetaManager`]); the storage layer
-/// does not perceive shard boundaries — each shard is a routing target, not a
-/// router (OB/TiDB model: the query engine decides ranges).
+/// Engine kind. Key in the engine map; carried in `ShardMeta` so the router
+/// picks the right engine per shard.
+#[derive(Eq, PartialEq, Hash, Clone, Debug)]
+pub enum Engine {
+    LsmTree,
+}
+
+/// Engine-level option, wrapped for multi-engine dispatch. Stored in the
+/// MetaManager system-config table (Plan 3); `StorageLayer::new` uses the
+/// default for now.
+#[derive(Clone)]
+pub enum EngineOption {
+    LsmTree(LsmEngineOption),
+}
+
+/// Storage data layer. Holds engines in a `DashMap<Engine, Arc<dyn StorageEngine>>`
+/// and routes by engine + shard_id. Knows nothing about table names or table
+/// metadata — that's [`crate::meta_manager::MetaManager`]'s job. MetaManager
+/// calls into this to write system-table rows and to `create_shard`.
 pub struct StorageLayer {
-    meta: MetaManager,
-    shards: DashMap<ShardId, Arc<dyn StorageEngine>>,
-    option: LsmOption,
+    engines: DashMap<Engine, Arc<dyn StorageEngine>>,
 }
 
 impl StorageLayer {
-    pub fn new(option: LsmOption) -> Self {
-        let layer = Self {
-            meta: MetaManager::new(),
-            shards: DashMap::new(),
-            option,
-        };
-        layer.ensure_shard(DEFAULT_SHARD);
-        layer
+    pub fn new(engine_option: LsmEngineOption) -> Self {
+        let engines: DashMap<Engine, Arc<dyn StorageEngine>> = DashMap::new();
+        let lsm = Arc::new(LsmEngine::new(engine_option));
+        // init consumes a clone of the Arc (the flush sweep thread keeps it
+        // alive); the original goes into the engines map.
+        let _ = lsm.clone().init();
+        engines.insert(Engine::LsmTree, lsm);
+        Self { engines }
     }
 
-    /// Ensure a shard exists, creating its [`LsmStore`] if needed.
-    fn ensure_shard(&self, id: ShardId) {
-        self.shards
-            .entry(id)
-            .or_insert_with(|| Arc::new(LsmStore::new(self.option.clone())) as Arc<dyn StorageEngine>);
+    /// Lifecycle: create a shard under `engine` from `table_option`. Called
+    /// only by `MetaManager::create_table`; read/write paths acquire an
+    /// already-created shard instead.
+    pub fn create_shard(
+        &self,
+        engine: &Engine,
+        shard_id: ShardId,
+        table_option: &TableOption,
+    ) -> StorageResult<()> {
+        let eng = self.map_engine(engine)?;
+        eng.create_shard(shard_id, table_option)
     }
 
-    /// Register a new table. Maps to [`DEFAULT_SHARD`] for now.
-    pub fn create_table(&self, table_name: &str) -> StorageResult<()> {
-        self.meta.create_table(table_name);
-        debug!("table registered: {table_name}");
-        Ok(())
+    /// Write a batch to `shard_id` under `engine`.
+    pub fn write(
+        &self,
+        engine: &Engine,
+        shard_id: ShardId,
+        batch: WriteBatch,
+    ) -> StorageResult<()> {
+        let eng = self.map_engine(engine)?;
+        eng.write(shard_id, batch)
     }
 
-    /// Write a batch to the shard backing `table_name`.
-    pub fn write(&self, table_name: &str, batch: WriteBatch) -> StorageResult<()> {
-        let shard_id = self.meta.shard_for(table_name)?;
-        let engine = self.acquire_engine(shard_id)?;
-        engine.write(batch)
-    }
-
-    /// Scan a key range on the shard backing `table_name`.
+    /// Scan a key range on `shard_id` under `engine`.
     pub fn scan(
         &self,
-        table_name: &str,
+        engine: &Engine,
+        shard_id: ShardId,
         range: (Bound<Bytes>, Bound<Bytes>),
         reverse: bool,
     ) -> StorageResult<Box<dyn ScanIter>> {
-        let shard_id = self.meta.shard_for(table_name)?;
-        let engine = self.acquire_engine(shard_id)?;
-        engine.scan(range, reverse)
+        let eng = self.map_engine(engine)?;
+        eng.scan(shard_id, range, reverse)
     }
 
-    /// Look up the engine for a shard, cloning the Arc to release the DashMap
-    /// guard before the (potentially slow) engine call.
-    fn acquire_engine(&self, shard_id: ShardId) -> StorageResult<Arc<dyn StorageEngine>> {
-        self.shards
-            .get(&shard_id)
-            .map(|r| r.value().clone())
-            .ok_or_else(|| StorageError::NotFound(format!("shard {shard_id}")))
-    }
-}
-
-/// Table metadata catalog: table_name → [`TableMeta`].
-struct MetaManager {
-    tables: DashMap<String, TableMeta>,
-    next_table_id: AtomicU64,
-}
-
-#[allow(dead_code)]
-struct TableMeta {
-    table_id: u64,
-    shard_ids: Vec<ShardId>, // always [DEFAULT_SHARD] for now
-}
-
-impl MetaManager {
-    fn new() -> Self {
-        Self {
-            tables: DashMap::new(),
-            next_table_id: AtomicU64::new(1),
-        }
-    }
-
-    fn create_table(&self, name: &str) {
-        self.tables.entry(name.to_string()).or_insert_with(|| {
-            let table_id = self.next_table_id.fetch_add(1, Ordering::Relaxed);
-            TableMeta {
-                table_id,
-                shard_ids: vec![DEFAULT_SHARD],
-            }
-        });
-    }
-
-    fn shard_for(&self, name: &str) -> StorageResult<ShardId> {
-        self.tables
-            .get(name)
-            .map(|t| t.shard_ids[0])
-            .ok_or_else(|| StorageError::NotFound(format!("table {name}")))
+    fn map_engine(&self, engine: &Engine) -> StorageResult<Arc<dyn StorageEngine>> {
+        self.engines
+            .get(engine)
+            .map(|e| e.value().clone())
+            .ok_or_else(|| StorageError::NotFound(format!("engine {engine:?} not registered")))
     }
 }

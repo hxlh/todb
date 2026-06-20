@@ -12,6 +12,7 @@ tracing = { workspace = true }
 ouroboros = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
+
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 tempfile = "3"
