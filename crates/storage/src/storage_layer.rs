@@ -1,4 +1,5 @@
 use std::ops::Bound;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -10,6 +11,7 @@ use crate::{
     iterators::ScanIter,
     lsm_engine::LsmEngine,
     lsm_state::LsmEngineOption,
+    log_service::{LogService, RgId, RgOption},
     write_batch::WriteBatch,
 };
 
@@ -34,6 +36,7 @@ pub enum EngineOption {
 /// calls into this to write system-table rows and to `create_shard`.
 pub struct StorageLayer {
     engines: DashMap<Engine, Arc<dyn StorageEngine>>,
+    log_service: Arc<LogService>,
 }
 
 impl StorageLayer {
@@ -44,7 +47,23 @@ impl StorageLayer {
         // alive); the original goes into the engines map.
         let _ = lsm.clone().init();
         engines.insert(Engine::LsmTree, lsm);
-        Self { engines }
+        Self {
+            engines,
+            log_service: Arc::new(LogService::default()),
+        }
+    }
+
+    /// Build with an explicit WAL root (used by tests / when a wal_root is
+    /// known at construction; production uses the default via [`new`]).
+    pub fn with_wal_root(engine_option: LsmEngineOption, wal_root: PathBuf) -> Self {
+        let engines: DashMap<Engine, Arc<dyn StorageEngine>> = DashMap::new();
+        let lsm = Arc::new(LsmEngine::new(engine_option));
+        let _ = lsm.clone().init();
+        engines.insert(Engine::LsmTree, lsm);
+        Self {
+            engines,
+            log_service: Arc::new(LogService::new(wal_root)),
+        }
     }
 
     /// Lifecycle: create a shard under `engine` from `table_option`. Called
@@ -54,10 +73,18 @@ impl StorageLayer {
         &self,
         engine: &Engine,
         shard_id: ShardId,
+        rg_id: RgId,
         table_option: &TableOption,
     ) -> StorageResult<()> {
         let eng = self.map_engine(engine)?;
-        eng.create_shard(shard_id, table_option)
+        let wal_store = self.log_service.get(rg_id)?;
+        eng.create_shard(shard_id, table_option, wal_store)
+    }
+
+    /// Lifecycle: create a replication group's WalStore via LogService. Must
+    /// be called before `create_shard` on this rg_id.
+    pub fn create_replication_group(&self, rg_id: RgId, opt: &RgOption) -> StorageResult<()> {
+        self.log_service.create_rg(rg_id, opt)
     }
 
     /// Write a batch to `shard_id` under `engine`.

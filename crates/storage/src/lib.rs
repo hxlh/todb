@@ -10,6 +10,7 @@ pub mod lsm_engine;
 pub mod lsm_iter;
 pub mod lsm_state;
 pub mod lsm_store;
+pub mod log_service;
 pub mod meta_manager;
 pub mod memtable;
 pub mod row_key;

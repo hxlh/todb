@@ -14,4 +14,6 @@ pub enum StorageError {
     NotFound(String),
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("wal corrupted: {0}")]
+    WalCorrupted(String),
 }

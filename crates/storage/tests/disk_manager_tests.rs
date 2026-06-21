@@ -118,7 +118,13 @@ fn table_option(max_imm: usize) -> TableOption {
 fn flush_oldest_imm_makes_data_readable_from_sst() {
     let tmp = tempfile::tempdir().unwrap();
     let engine = Arc::new(LsmEngine::new(engine_option(tmp.path(), Duration::from_secs(10))));
-    engine.create_shard(DEFAULT_SHARD, &table_option(4)).unwrap();
+    engine
+        .create_shard(
+            DEFAULT_SHARD,
+            &table_option(4),
+            Arc::new(storage::wal::NoopWal),
+        )
+        .unwrap();
     let store = engine.acquire(DEFAULT_SHARD).unwrap();
 
     for i in 0..20u32 {
@@ -144,7 +150,13 @@ fn flush_oldest_imm_makes_data_readable_from_sst() {
 fn write_force_flushes_when_imm_count_exceeds_limit() {
     let tmp = tempfile::tempdir().unwrap();
     let engine = Arc::new(LsmEngine::new(engine_option(tmp.path(), Duration::from_secs(10))));
-    engine.create_shard(DEFAULT_SHARD, &table_option(2)).unwrap();
+    engine
+        .create_shard(
+            DEFAULT_SHARD,
+            &table_option(2),
+            Arc::new(storage::wal::NoopWal),
+        )
+        .unwrap();
     let store = engine.acquire(DEFAULT_SHARD).unwrap();
 
     for i in 0..200u32 {
@@ -167,7 +179,13 @@ fn write_force_flushes_when_imm_count_exceeds_limit() {
 fn lsm_engine_flush_scheduler_flushes_immutables() {
     let tmp = tempfile::tempdir().unwrap();
     let engine = Arc::new(LsmEngine::new(engine_option(tmp.path(), Duration::from_millis(100))));
-    engine.create_shard(DEFAULT_SHARD, &table_option(4)).unwrap();
+    engine
+        .create_shard(
+            DEFAULT_SHARD,
+            &table_option(4),
+            Arc::new(storage::wal::NoopWal),
+        )
+        .unwrap();
     let store = engine.acquire(DEFAULT_SHARD).unwrap();
     for i in 0..20u32 {
         store.write(put(&i.to_be_bytes(), b"v")).unwrap();

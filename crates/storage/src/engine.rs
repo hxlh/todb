@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::{errors::StorageResult, iterators::ScanIter, lsm_state::LsmTableOption, write_batch::WriteBatch};
+use crate::{errors::StorageResult, iterators::ScanIter, lsm_state::LsmTableOption, wal::WalStore, write_batch::WriteBatch};
 
 /// Identifies a shard within the storage layer.
 pub type ShardId = u64;
@@ -33,7 +33,12 @@ pub trait StorageEngine: Send + Sync {
     /// Consumes an `Arc<Self>` so spawned threads keep the engine alive
     /// (OB-style: background pools start during init, not at construction).
     fn init(self: Arc<Self>) -> StorageResult<()>;
-    fn create_shard(&self, shard_id: ShardId, table_option: &TableOption) -> StorageResult<()>;
+    fn create_shard(
+        &self,
+        shard_id: ShardId,
+        table_option: &TableOption,
+        wal_store: Arc<dyn WalStore>,
+    ) -> StorageResult<()>;
     fn write(&self, shard_id: ShardId, batch: WriteBatch) -> StorageResult<()>;
     fn scan(
         &self,

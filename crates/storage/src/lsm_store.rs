@@ -22,6 +22,7 @@ use crate::{
     lsm_iter::{LsmForwardScan, LsmReverseScan},
     lsm_state::{LevelMeta, LsmState, LsmTableOption, SstMeta},
     memtable::{Entry, MemTable, OwnedMemTableIter},
+    wal::WalStore,
     write_batch::{WriteBatch, WriteEntry},
 };
 
@@ -43,23 +44,28 @@ pub struct LsmStore {
     table_option: LsmTableOption,
     disk_manager: Arc<DiskManager>,
     shard_id: ShardId,
+    /// Shared per-RG WAL (injected by LsmEngine at create_shard time, sourced
+    /// from LogService). `write` appends here before applying the memtable.
+    wal: Arc<dyn WalStore>,
     /// Serializes concurrent flush of this shard (write force vs scheduler).
     flush_lock: Mutex<()>,
 }
 
 impl LsmStore {
-    /// `disk_manager` and `table_option` are injected by LsmEngine at
+    /// `disk_manager`, `table_option` and `wal` are injected by LsmEngine at
     /// `create_shard` time.
     pub(crate) fn new(
         table_option: LsmTableOption,
         disk_manager: Arc<DiskManager>,
         shard_id: ShardId,
+        wal: Arc<dyn WalStore>,
     ) -> Self {
         Self {
             state: Arc::new(RwLock::new(Arc::new(LsmState::new()))),
             table_option,
             disk_manager,
             shard_id,
+            wal,
             flush_lock: Mutex::new(()),
         }
     }
@@ -219,6 +225,7 @@ impl LsmStore {
 
 impl TableStore for LsmStore {
     fn write(&self, batch: WriteBatch) -> StorageResult<()> {
+        self.wal.append(self.shard_id, &batch)?; // WAL first (crash safety)
         let need_switch = {
             let state = self.snapshot();
             let active = &state.active_mem;

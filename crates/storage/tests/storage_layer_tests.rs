@@ -7,7 +7,7 @@ use storage::{
     engine::TableOption,
     iterators::ScanIter,
     lsm_state::{LsmEngineOption, LsmTableOption},
-    meta_manager::MetaManager,
+    meta_manager::{MetaManager, DEFAULT_RG},
     storage_layer::{Engine, StorageLayer},
     write_batch::WriteBatch,
 };
@@ -43,7 +43,10 @@ fn table_option() -> TableOption {
 
 /// Build a StorageLayer + MetaManager over a temp data_dir.
 fn make_layer(dir: &Path) -> (Arc<StorageLayer>, MetaManager) {
-    let storage = Arc::new(StorageLayer::new(engine_option(dir)));
+    let storage = Arc::new(StorageLayer::with_wal_root(
+        engine_option(dir),
+        dir.join("wal"),
+    ));
     let meta = MetaManager::new(storage.clone());
     (storage, meta)
 }
@@ -52,7 +55,7 @@ fn make_layer(dir: &Path) -> (Arc<StorageLayer>, MetaManager) {
 fn test_write_then_scan_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let (storage, meta) = make_layer(dir.path());
-    meta.create_table("t1", Engine::LsmTree, table_option()).unwrap();
+    meta.create_table(DEFAULT_RG, "t1", Engine::LsmTree, table_option()).unwrap();
     let shard = meta.shard_for("t1").unwrap();
 
     let mut batch = WriteBatch::new();
@@ -74,7 +77,7 @@ fn test_write_then_scan_roundtrip() {
 fn test_delete_tombstone() {
     let dir = tempfile::tempdir().unwrap();
     let (storage, meta) = make_layer(dir.path());
-    meta.create_table("t1", Engine::LsmTree, table_option()).unwrap();
+    meta.create_table(DEFAULT_RG, "t1", Engine::LsmTree, table_option()).unwrap();
     let shard = meta.shard_for("t1").unwrap();
 
     let mut batch = WriteBatch::new();
@@ -101,7 +104,7 @@ fn test_delete_tombstone() {
 fn test_range_scan_lower_bound() {
     let dir = tempfile::tempdir().unwrap();
     let (storage, meta) = make_layer(dir.path());
-    meta.create_table("t1", Engine::LsmTree, table_option()).unwrap();
+    meta.create_table(DEFAULT_RG, "t1", Engine::LsmTree, table_option()).unwrap();
     let shard = meta.shard_for("t1").unwrap();
 
     let mut batch = WriteBatch::new();
@@ -123,7 +126,7 @@ fn test_range_scan_lower_bound() {
 fn test_range_scan_upper_bound() {
     let dir = tempfile::tempdir().unwrap();
     let (storage, meta) = make_layer(dir.path());
-    meta.create_table("t1", Engine::LsmTree, table_option()).unwrap();
+    meta.create_table(DEFAULT_RG, "t1", Engine::LsmTree, table_option()).unwrap();
     let shard = meta.shard_for("t1").unwrap();
 
     let mut batch = WriteBatch::new();

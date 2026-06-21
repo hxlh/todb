@@ -12,6 +12,7 @@ use crate::{
     iterators::ScanIter,
     lsm_state::LsmEngineOption,
     lsm_store::LsmStore,
+    wal::WalStore,
     write_batch::WriteBatch,
 };
 
@@ -83,13 +84,25 @@ impl StorageEngine for LsmEngine {
     /// register it (OB-style `create_tablet`). Idempotent — an existing shard
     /// is left as-is. Called only by the create_table lifecycle path; read/
     /// write use `acquire`.
-    fn create_shard(&self, shard_id: ShardId, table_option: &TableOption) -> StorageResult<()> {
+    fn create_shard(
+        &self,
+        shard_id: ShardId,
+        table_option: &TableOption,
+        wal_store: Arc<dyn WalStore>,
+    ) -> StorageResult<()> {
         let opt = match table_option {
             TableOption::LsmTree(o) => o.clone(),
         };
         self.shards
             .entry(shard_id)
-            .or_insert_with(|| Arc::new(LsmStore::new(opt, self.disk_manager.clone(), shard_id)));
+            .or_insert_with(|| {
+                Arc::new(LsmStore::new(
+                    opt,
+                    self.disk_manager.clone(),
+                    shard_id,
+                    wal_store,
+                ))
+            });
         Ok(())
     }
 
