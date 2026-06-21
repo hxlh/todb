@@ -80,19 +80,30 @@ impl DiskManager {
     }
 
     /// Open an SST by id: locate its file, decode the footer from the tail,
-    /// and return the reader + footer.
+    /// and return the reader + footer. The footer is self-describing length
+    /// (a `body_len:u32` trailer), so we read the last 4 bytes first.
     pub fn open(&self, sst_id: SstId) -> StorageResult<SstFileReader> {
         let path = self.sst_path(sst_id);
         let file = std::fs::File::open(&path)
             .map_err(|_| StorageError::NotFound(format!("sst {sst_id}")))?;
         let file_size = file.metadata()?.len() as usize;
-        if file_size < SstFooter::ENCODED_LEN {
+        if file_size < 4 {
             return Err(StorageError::InvalidValue(format!(
-                "sst {sst_id}: file too small for footer"
+                "sst {sst_id}: file too small for footer trailer"
             )));
         }
-        let mut fbuf = [0u8; SstFooter::ENCODED_LEN];
-        file.read_exact_at(&mut fbuf, (file_size - SstFooter::ENCODED_LEN) as u64)?;
+        // Read the body_len trailer (last 4 bytes), then the body.
+        let mut trailer = [0u8; 4];
+        file.read_exact_at(&mut trailer, (file_size - 4) as u64)?;
+        let body_len = u32::from_be_bytes(trailer) as usize;
+        let footer_total = body_len + 4;
+        if file_size < footer_total {
+            return Err(StorageError::InvalidValue(format!(
+                "sst {sst_id}: file too small for footer body"
+            )));
+        }
+        let mut fbuf = vec![0u8; footer_total];
+        file.read_exact_at(&mut fbuf, (file_size - footer_total) as u64)?;
         let footer = SstFooter::decode(&fbuf)?;
         let reader = FileBlockReader::from_file(file, self.block_size);
         Ok(SstFileReader { reader, footer })

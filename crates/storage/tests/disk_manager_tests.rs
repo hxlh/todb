@@ -37,6 +37,20 @@ fn write_one_sst(dm: &DiskManager, key: &[u8], val: &[u8]) -> u64 {
     id
 }
 
+/// Build one real SST with the given keys (all mapped to "v"); return sst_id.
+fn write_multi_sst(dm: &DiskManager, keys: &[&[u8]]) -> u64 {
+    let writer = dm.create_sst().unwrap();
+    let id = writer.sst_id();
+    let opt = SstOption::default().block_size(dm.block_size());
+    let mut b = SstBuilder::new(DefaultSstWriter::new(writer, &opt), opt);
+    for k in keys {
+        b.add(Bytes::copy_from_slice(k), Bytes::from_static(b"v"))
+            .unwrap();
+    }
+    b.finish().unwrap();
+    id
+}
+
 #[test]
 fn create_sst_assigns_globally_monotonic_ids() {
     let tmp = tempfile::tempdir().unwrap();
@@ -63,6 +77,8 @@ fn open_reads_footer_back_from_file_tail() {
 
     let SstFileReader { reader, footer } = dm.open(id).unwrap();
     assert!(footer.tree_height >= 1); // non-empty SST has a root index level
+    assert_eq!(footer.first_key, Bytes::copy_from_slice(b"k1"));
+    assert_eq!(footer.last_key, Bytes::copy_from_slice(b"k1"));
     let blk = reader.read_block(&Position { offset: 0 }).unwrap();
     assert_eq!(blk.len(), 256);
 }
@@ -72,6 +88,20 @@ fn open_unknown_sst_id_is_not_found() {
     let tmp = tempfile::tempdir().unwrap();
     let dm = DiskManager::new(tmp.path().to_path_buf(), 256);
     assert!(dm.open(999).is_err());
+}
+
+#[test]
+fn open_footer_reflects_first_and_last_key_across_blocks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dm = DiskManager::new(tmp.path().to_path_buf(), 64);
+    // 30 distinct keys span multiple data blocks (block_size 64).
+    let keys: Vec<Vec<u8>> = (0..30u32).map(|i| format!("k{i:05}").into_bytes()).collect();
+    let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+    let id = write_multi_sst(&dm, &key_refs);
+
+    let SstFileReader { footer, .. } = dm.open(id).unwrap();
+    assert_eq!(footer.first_key, Bytes::from_static(b"k00000"));
+    assert_eq!(footer.last_key, Bytes::from_static(b"k00029"));
 }
 
 #[test]

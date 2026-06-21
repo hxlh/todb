@@ -116,10 +116,6 @@ impl LsmStore {
         let opt = SstOption::default().block_size(self.disk_manager.block_size());
         let mut builder = SstBuilder::new(DefaultSstWriter::new(writer, &opt), opt);
 
-        let map = imm.map_arc();
-        let smallest = map.front().map(|e| e.key().clone()).unwrap_or_default();
-        let largest = map.back().map(|e| e.key().clone()).unwrap_or_default();
-
         let mut iter = imm.iter();
         ForwardIter::seek_to_first(&mut iter)?;
         while iter.valid() {
@@ -131,11 +127,13 @@ impl LsmStore {
             ForwardIter::next(&mut iter)?;
         }
 
-        let (_footer, sst_writer) = builder.finish()?;
+        // key_range sourced from the footer (single source of truth), not from
+        // a separate memtable front/back scan.
+        let (footer, sst_writer) = builder.finish()?;
         let file_size = sst_writer.into_inner().file_size();
         Ok(SstMeta {
             id: sst_id,
-            key_range: (smallest, largest),
+            key_range: (footer.first_key, footer.last_key),
             file_size,
         })
     }

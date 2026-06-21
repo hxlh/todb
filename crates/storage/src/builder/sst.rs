@@ -44,6 +44,8 @@ pub struct SstBuilder<S: SstWriter> {
     data_builder: DataBlockBuilder,
     index_builders: Vec<IndexBlockBuilder>,
     option: SstOption,
+    first_key: Option<Bytes>,
+    last_key: Option<Bytes>,
 }
 
 impl<S: SstWriter> SstBuilder<S> {
@@ -53,10 +55,16 @@ impl<S: SstWriter> SstBuilder<S> {
             data_builder: DataBlockBuilder::new(&option),
             index_builders: Vec::new(),
             option,
+            first_key: None,
+            last_key: None,
         }
     }
     /// Add one sorted entry. Caller must guarantee keys are in ascending order.
     pub fn add(&mut self, key: Bytes, value: Bytes) -> StorageResult<()> {
+        if self.first_key.is_none() {
+            self.first_key = Some(key.clone());
+        }
+        self.last_key = Some(key.clone());
         if self.data_builder.would_exceed(&key, &value) {
             self.flush_data_block()?;
         }
@@ -66,6 +74,10 @@ impl<S: SstWriter> SstBuilder<S> {
 
     /// Add a delete tombstone. Caller must guarantee keys are in ascending order.
     pub fn add_delete(&mut self, key: Bytes) -> StorageResult<()> {
+        if self.first_key.is_none() {
+            self.first_key = Some(key.clone());
+        }
+        self.last_key = Some(key.clone());
         if self.data_builder.would_exceed(&key, &Bytes::new()) {
             self.flush_data_block()?;
         }
@@ -152,6 +164,8 @@ impl<S: SstWriter> SstBuilder<S> {
         let footer = SstFooter {
             root_index_block_position: root_position,
             tree_height: height,
+            first_key: self.first_key.clone().unwrap_or_default(),
+            last_key: self.last_key.clone().unwrap_or_default(),
         };
 
         self.writer.write_footer(&footer)?;
@@ -160,33 +174,71 @@ impl<S: SstWriter> SstBuilder<S> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Trailing metadata of an SST file. Self-describing length: the body is
+/// followed by a `body_len:u32` trailer so the reader locates the footer by
+/// reading the last 4 bytes first.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SstFooter {
     pub root_index_block_position: Position,
     pub tree_height: u32,
+    /// Smallest key in the SST (empty for an empty SST).
+    pub first_key: Bytes,
+    /// Largest key in the SST (empty for an empty SST).
+    pub last_key: Bytes,
 }
 
 impl SstFooter {
-    pub const ENCODED_LEN: usize = 12;
+    /// Minimum footer size: body with empty keys (20B) + trailer (4B).
+    pub const MIN_LEN: usize = 24;
 
-    pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
-        let mut buf = [0u8; Self::ENCODED_LEN];
-        buf[0..8].copy_from_slice(&self.root_index_block_position.offset.to_be_bytes());
-        buf[8..12].copy_from_slice(&self.tree_height.to_be_bytes());
-        buf
+    /// Encode as `body ++ [body_len:u32]`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(20 + self.first_key.len() + self.last_key.len());
+        body.extend_from_slice(&self.root_index_block_position.offset.to_be_bytes());
+        body.extend_from_slice(&self.tree_height.to_be_bytes());
+        body.extend_from_slice(&(self.first_key.len() as u32).to_be_bytes());
+        body.extend_from_slice(&(self.last_key.len() as u32).to_be_bytes());
+        body.extend_from_slice(&self.first_key);
+        body.extend_from_slice(&self.last_key);
+        let mut out = body;
+        out.extend_from_slice(&(out.len() as u32).to_be_bytes()); // trailer = body_len
+        out
     }
 
+    /// Decode from a buffer that is `body ++ [body_len:u32]` (the full footer
+    /// region read from the file tail).
     pub fn decode(buf: &[u8]) -> StorageResult<Self> {
-        if buf.len() < Self::ENCODED_LEN {
+        if buf.len() < 4 {
             return Err(StorageError::InvalidValue(
-                "footer too short".into(),
+                "footer too short for trailer".into(),
             ));
         }
+        let body_len = u32::from_be_bytes(buf[buf.len() - 4..].try_into().unwrap()) as usize;
+        if buf.len() < body_len + 4 {
+            return Err(StorageError::InvalidValue("footer truncated".into()));
+        }
+        let body = &buf[..body_len];
+        if body.len() < 20 {
+            return Err(StorageError::InvalidValue("footer body too short".into()));
+        }
+        let root_offset = u64::from_be_bytes(body[0..8].try_into().unwrap());
+        let tree_height = u32::from_be_bytes(body[8..12].try_into().unwrap());
+        let first_key_len = u32::from_be_bytes(body[12..16].try_into().unwrap()) as usize;
+        let last_key_len = u32::from_be_bytes(body[16..20].try_into().unwrap()) as usize;
+        if 20 + first_key_len + last_key_len != body_len {
+            return Err(StorageError::InvalidValue(
+                "footer key length mismatch".into(),
+            ));
+        }
+        let first_key = Bytes::copy_from_slice(&body[20..20 + first_key_len]);
+        let last_key = Bytes::copy_from_slice(
+            &body[20 + first_key_len..20 + first_key_len + last_key_len],
+        );
         Ok(Self {
-            root_index_block_position: Position {
-                offset: u64::from_be_bytes(buf[0..8].try_into().unwrap()),
-            },
-            tree_height: u32::from_be_bytes(buf[8..12].try_into().unwrap()),
+            root_index_block_position: Position { offset: root_offset },
+            tree_height,
+            first_key,
+            last_key,
         })
     }
 }
@@ -244,24 +296,42 @@ mod tests {
     }
 
     #[test]
-    fn test_footer_encodes_root_offset_and_tree_height() {
+    fn test_footer_encodes_fields_and_keys() {
         let footer = SstFooter {
             root_index_block_position: Position {
                 offset: 0x0102_0304_0506_0708,
             },
             tree_height: 0x1112_1314,
+            first_key: Bytes::from_static(b"aaa"),
+            last_key: Bytes::from_static(b"zzz"),
         };
-
         let encoded = footer.encode();
-
-        assert_eq!(encoded.len(), SstFooter::ENCODED_LEN);
-        assert_eq!(&encoded[0..8], &0x0102_0304_0506_0708u64.to_be_bytes());
-        assert_eq!(&encoded[8..12], &0x1112_1314u32.to_be_bytes());
-        assert_eq!(SstFooter::decode(&encoded).unwrap(), footer);
+        assert!(encoded.len() >= SstFooter::MIN_LEN);
+        let decoded = SstFooter::decode(&encoded).unwrap();
+        assert_eq!(decoded, footer);
     }
 
     #[test]
-    fn test_builder_writes_footer_after_fixed_size_block_slots() {
+    fn test_footer_empty_keys() {
+        let footer = SstFooter {
+            root_index_block_position: Position { offset: 0 },
+            tree_height: 0,
+            first_key: Bytes::new(),
+            last_key: Bytes::new(),
+        };
+        let encoded = footer.encode();
+        assert_eq!(encoded.len(), SstFooter::MIN_LEN);
+        let decoded = SstFooter::decode(&encoded).unwrap();
+        assert_eq!(decoded, footer);
+    }
+
+    #[test]
+    fn test_footer_rejects_truncated_trailer() {
+        assert!(SstFooter::decode(&[0u8; 3]).is_err());
+    }
+
+    #[test]
+    fn test_builder_writes_footer_after_blocks() {
         let block_size = 256;
         let mut builder = fixed_builder(block_size);
         for i in 0..100u64 {
@@ -271,9 +341,10 @@ mod tests {
         let (footer, sst_writer) = builder.finish().unwrap();
         let writer = sst_writer.into_inner();
         let buf = writer.into_inner();
-        assert!(buf.len() > SstFooter::ENCODED_LEN);
 
-        let footer_start = buf.len() - SstFooter::ENCODED_LEN;
+        // footer body_len trailer is the last 4 bytes
+        let body_len = u32::from_be_bytes(buf[buf.len() - 4..].try_into().unwrap()) as usize;
+        let footer_start = buf.len() - body_len - 4;
         assert_eq!(footer_start % block_size, 0);
         assert_eq!(footer.root_index_block_position.offset as usize % block_size, 0);
 
@@ -283,13 +354,13 @@ mod tests {
 
     #[test]
     fn test_empty_sst_writes_only_footer() {
-        let builder = fixed_builder(256);
-        let (footer, sst_writer) = builder.finish().unwrap();
-        let writer = sst_writer.into_inner();
-        let buf = writer.into_inner();
-        assert_eq!(buf.len(), SstFooter::ENCODED_LEN);
+        let (footer, sst_writer) = fixed_builder(256).finish().unwrap();
+        let buf = sst_writer.into_inner().into_inner();
+        assert_eq!(buf.len(), SstFooter::MIN_LEN);
         assert_eq!(footer.root_index_block_position, Position { offset: 0 });
         assert_eq!(footer.tree_height, 0);
+        assert!(footer.first_key.is_empty());
+        assert!(footer.last_key.is_empty());
         assert_eq!(SstFooter::decode(&buf).unwrap(), footer);
     }
 
@@ -298,5 +369,23 @@ mod tests {
         let builder = fixed_builder(256);
         let (footer, _) = builder.finish().unwrap();
         assert_eq!(footer.root_index_block_position, Position { offset: 0 });
+    }
+
+    #[test]
+    fn test_builder_footer_records_first_and_last_key() {
+        let mut builder = fixed_builder(4096);
+        for i in 0..100u64 {
+            builder.add(make_key(i), make_value(i)).unwrap();
+        }
+        let (footer, _) = builder.finish().unwrap();
+        assert_eq!(footer.first_key, make_key(0));
+        assert_eq!(footer.last_key, make_key(99));
+    }
+
+    #[test]
+    fn test_builder_footer_empty_when_no_entries() {
+        let (footer, _) = fixed_builder(4096).finish().unwrap();
+        assert!(footer.first_key.is_empty());
+        assert!(footer.last_key.is_empty());
     }
 }
