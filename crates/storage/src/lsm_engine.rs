@@ -4,6 +4,7 @@ use std::sync::{Arc, OnceLock};
 use bytes::Bytes;
 use dashmap::DashMap;
 
+use crate::wal::DynWalStore;
 use crate::{
     disk_manager::DiskManager,
     engine::{ShardId, StorageEngine, TableOption, TableStore},
@@ -12,7 +13,6 @@ use crate::{
     iterators::ScanIter,
     lsm_state::LsmEngineOption,
     lsm_store::LsmStore,
-    wal::WalStore,
     write_batch::WriteBatch,
 };
 
@@ -88,7 +88,7 @@ impl StorageEngine for LsmEngine {
         &self,
         shard_id: ShardId,
         table_option: &TableOption,
-        wal_store: Arc<dyn WalStore>,
+        wal_store: Arc<DynWalStore>,
     ) -> StorageResult<()> {
         let opt = match table_option {
             TableOption::LsmTree(o) => o.clone(),

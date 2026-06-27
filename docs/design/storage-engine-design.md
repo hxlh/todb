@@ -4,6 +4,26 @@ This document describes the current LSM-based storage engine design for todb.
 
 For detailed original design, see `old_docs/storage_design.md`.
 
+## WAL Implementation Status
+
+**Note**: As of 2026-06-27, todb has TWO WAL implementations coexisting:
+
+1. **`wal_legacy/` (original)**: Simple segment-based WAL integrated with LsmStore
+   - Used by current storage layer
+   - Basic append/sync/recover operations
+   - Async sync with 100ms interval
+   
+2. **`wal_v2/` (new, from wal-demo)**: Advanced O_DIRECT WAL implementation
+   - Lock-free multi-writer append
+   - CLOCK buffer pool for reads
+   - Disk-based LSN index (.log + .idx files)
+   - Full truncate_before/truncate_after support
+   - Comprehensive crash recovery
+   - **Not yet integrated with storage layer**
+   - See `docs/architecture/wal-design.md` for full technical design
+
+Integration of wal_v2 with LsmStore/ReplicationGroup is planned as a future task.
+
 ## Architecture Overview
 
 ```

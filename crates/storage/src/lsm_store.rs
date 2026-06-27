@@ -5,12 +5,7 @@ use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 
 use crate::{
-    block::FileBlockReader,
-    builder::{DefaultSstWriter, SstBuilder, SstOption},
-    disk_manager::DiskManager,
-    engine::{ShardId, TableStore},
-    errors::StorageResult,
-    iterators::{
+    block::FileBlockReader, builder::{DefaultSstWriter, SstBuilder, SstOption}, disk_manager::DiskManager, engine::{ShardId, TableStore}, errors::StorageResult, iterators::{
         concat_iter::ConcatIter,
         map_iter::MapIter,
         merge_iter::MergeIter,
@@ -18,12 +13,7 @@ use crate::{
         sst_iter::SstIter,
         storage_iter::{ForwardIter, IterRead},
         two_merge_iter::TwoMergeIter,
-    },
-    lsm_iter::{LsmForwardScan, LsmReverseScan},
-    lsm_state::{LevelMeta, LsmState, LsmTableOption, SstMeta},
-    memtable::{Entry, MemTable, OwnedMemTableIter},
-    wal::WalStore,
-    write_batch::{WriteBatch, WriteEntry},
+    }, lsm_iter::{LsmForwardScan, LsmReverseScan}, lsm_state::{LevelMeta, LsmState, LsmTableOption, SstMeta}, memtable::{Entry, MemTable, OwnedMemTableIter}, wal::DynWalStore, write_batch::{WriteBatch, WriteEntry}
 };
 
 // ── Iterator type aliases for the scan path ──
@@ -46,7 +36,7 @@ pub struct LsmStore {
     shard_id: ShardId,
     /// Shared per-RG WAL (injected by LsmEngine at create_shard time, sourced
     /// from LogService). `write` appends here before applying the memtable.
-    wal: Arc<dyn WalStore>,
+    wal: Arc<crate::wal::DynWalStore>,
     /// Serializes concurrent flush of this shard (write force vs scheduler).
     flush_lock: Mutex<()>,
 }
@@ -58,7 +48,7 @@ impl LsmStore {
         table_option: LsmTableOption,
         disk_manager: Arc<DiskManager>,
         shard_id: ShardId,
-        wal: Arc<dyn WalStore>,
+        wal: Arc<DynWalStore>,
     ) -> Self {
         Self {
             state: Arc::new(RwLock::new(Arc::new(LsmState::new()))),

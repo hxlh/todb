@@ -6,8 +6,7 @@ use dashmap::DashMap;
 
 use crate::{
     errors::{StorageError, StorageResult},
-    wal::file_wal_store::FileWalStore,
-    wal::WalStore,
+    wal::{DynWalStore, file_wal_store::FileWalStore},
 };
 
 pub type RgId = u64;
@@ -39,7 +38,7 @@ impl Default for RgOption {
 /// engine (LSM, future B+tree all share a RG's WalStore).
 pub struct LogService {
     wal_root: PathBuf,
-    stores: DashMap<RgId, Arc<dyn WalStore>>,
+    stores: DashMap<RgId, Arc<DynWalStore>>,
 }
 
 impl LogService {
@@ -70,12 +69,12 @@ impl LogService {
             opt.wal_segment_size,
         ));
         store.start_sync(opt.wal_sync_interval);
-        self.stores.insert(rg_id, store as Arc<dyn WalStore>);
+        self.stores.insert(rg_id, store as Arc<DynWalStore>);
         Ok(())
     }
 
     /// Get the WalStore for `rg_id`. NotFound if not created.
-    pub fn get(&self, rg_id: RgId) -> StorageResult<Arc<dyn WalStore>> {
+    pub fn get(&self, rg_id: RgId) -> StorageResult<Arc<DynWalStore>> {
         self.stores
             .get(&rg_id)
             .map(|r| r.value().clone())

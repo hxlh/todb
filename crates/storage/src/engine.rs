@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::{errors::StorageResult, iterators::ScanIter, lsm_state::LsmTableOption, wal::WalStore, write_batch::WriteBatch};
+use crate::{errors::StorageResult, iterators::ScanIter, lsm_state::LsmTableOption, write_batch::WriteBatch};
 
 /// Identifies a shard within the storage layer.
 pub type ShardId = u64;
@@ -37,7 +37,8 @@ pub trait StorageEngine: Send + Sync {
         &self,
         shard_id: ShardId,
         table_option: &TableOption,
-        wal_store: Arc<dyn WalStore>,
+        // TODO: Re-add wal_store parameter when integrating wal_v2
+        // wal_store: Arc<dyn WalStore>,
     ) -> StorageResult<()>;
     fn write(&self, shard_id: ShardId, batch: WriteBatch) -> StorageResult<()>;
     fn scan(

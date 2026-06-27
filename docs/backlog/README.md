@@ -22,10 +22,11 @@ See `docs/context/ai-autonomy-policy.md` for definitions.
 
 | Priority | Item | Status | Autonomy | Owner Doc | Blockers | Notes |
 |----------|------|--------|----------|-----------|----------|-------|
-| 1 | Add L0 → L1 compaction | blocked | plan-first | (needs design doc) | Design needed | See old_docs for OB/TiKV references |
-| 2 | Metadata persistence | blocked | plan-first | (needs design doc) | Design needed | RG + shard metadata to disk |
-| 3 | Full restart recovery | blocked | plan-first | (needs design doc) | Items 1+2 | WAL replay + metadata load |
-| 4 | SST key range filtering | ready | implement | docs/design/storage-engine-design.md | none | Use SST footer first/last keys |
+| 1 | Integrate wal_v2 with LsmStore | blocked | plan-first | docs/architecture/wal-design.md | Design needed | Replace wal_legacy with wal_v2 |
+| 2 | Add L0 → L1 compaction | blocked | plan-first | (needs design doc) | Design needed | See old_docs for OB/TiKV references |
+| 3 | Metadata persistence | blocked | plan-first | (needs design doc) | Design needed | RG + shard metadata to disk |
+| 4 | Full restart recovery | blocked | plan-first | (needs design doc) | Items 2+3 | WAL replay + metadata load |
+| 5 | SST key range filtering | ready | implement | docs/design/storage-engine-design.md | none | Use SST footer first/last keys |
 
 ## Backlog Selection Rule
 
