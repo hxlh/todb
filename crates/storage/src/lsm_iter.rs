@@ -1,5 +1,4 @@
 use std::ops::Bound;
-use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -7,7 +6,7 @@ use crate::{
     errors::StorageResult,
     iterators::{
         scan_iter::ScanIter,
-        storage_iter::{AsArray, ForwardIter, IterRead, ReverseIter},
+        storage_iter::{AsArray, ForwardIter, ReverseIter},
     },
     memtable::Entry,
 };

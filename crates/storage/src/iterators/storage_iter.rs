@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use std::ops::Deref;
 
 use crate::errors::StorageResult;
 
@@ -52,8 +52,14 @@ pub trait ReverseIter: IterRead {
 /// Abstracts the format of an index block.
 /// Implementations yield (key, Position) pairs from raw block bytes.
 /// Different index formats (B+tree node, prefix-compressed, etc.) implement this.
+///
+/// `Block` is the storage type the iterator holds (e.g. owned `Bytes` for LSM,
+/// or a borrowed guard for cached reads). `from_block` takes ownership of it
+/// directly — no copy when the source already owns the bytes.
 pub trait IndexBlockIter: IterRead {
-    fn from_block(block: Bytes) -> StorageResult<Self>
+    type Block: Deref<Target = [u8]>;
+
+    fn from_block(block: Self::Block) -> StorageResult<Self>
     where
         Self: Sized;
 
@@ -68,7 +74,9 @@ pub trait IndexBlockIter: IterRead {
 /// Abstracts the format of a data block.
 /// Implementations yield (key, value) pairs from raw block bytes.
 pub trait DataBlockIter: IterBase {
-    fn from_block(block: Bytes) -> StorageResult<Self>
+    type Block: Deref<Target = [u8]>;
+
+    fn from_block(block: Self::Block) -> StorageResult<Self>
     where
         Self: Sized;
 }

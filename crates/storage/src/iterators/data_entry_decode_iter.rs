@@ -1,5 +1,3 @@
-use bytes::Bytes;
-
 use crate::{
     errors::{StorageError, StorageResult},
     iterators::storage_iter::{AsArray, DataBlockIter, ForwardIter, IterBase, IterRead, ReverseIter},
@@ -151,7 +149,9 @@ where
     I: DataBlockIter,
     for<'a> I::Value<'a>: AsArray<'a>,
 {
-    fn from_block(block: Bytes) -> StorageResult<Self> {
+    type Block = I::Block;
+
+    fn from_block(block: I::Block) -> StorageResult<Self> {
         Ok(Self::new(I::from_block(block)?))
     }
 }

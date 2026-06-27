@@ -1,14 +1,14 @@
 //! `O_DIRECT` block read cache. Serves aligned block reads via a fixed-frame
 //! CLOCK buffer pool keyed by `BlockKey` (segment id + block index): N pre-
 //! allocated frames, second-chance eviction, per-frame pinning. `read_block`
-//! returns a borrowed [`PinGuard`] and blocks on a `Condvar` when every frame is
-//! pinned. See `wal-design.md`
+//! returns an owned (`'static`) [`PinGuard`] holding an `Arc` to the pool, and
+//! blocks on a `Condvar` when every frame is pinned. See `wal-design.md`
 //! §Read path.
 
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::os::unix::io::RawFd;
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use crate::wal::segment::pread_all;
 use crate::wal::{AlignedMem, WalError};
@@ -136,21 +136,35 @@ impl ClockCache {
     }
 }
 
-/// Fixed-frame CLOCK buffer pool under one `Mutex` + `Condvar`. Readers pin frames
-/// via [`PinGuard`]; `read_block` blocks only when all frames are pinned. Rationale
-/// + the reversal from the earlier Arc-survives LRU: `tradeoffs §22`.
-pub struct DiskManager {
+/// Shared pool state, refcounted so each [`PinGuard`] keeps it alive via an
+/// `Arc<Inner>`. This is what makes `PinGuard` `'static` (no borrow of the
+/// manager): its `Drop` reaches the pool through the `Arc`, so the pool cannot
+/// be freed while any guard is live. See `wal-design.md` §Read path.
+struct DiskManagerInner {
     block_size: usize,
     cache: Mutex<ClockCache>,
     cv: Condvar,
 }
 
+/// Fixed-frame CLOCK buffer pool under one `Mutex` + `Condvar`. Readers pin frames
+/// via [`PinGuard`]; `read_block` blocks only when all frames are pinned. Rationale
+/// + the reversal from the earlier Arc-survives LRU: `tradeoffs §22`.
+///
+/// The shared state lives behind `Arc<DiskManagerInner>` so [`PinGuard`] can be
+/// `'static` (it clones the `Arc`) instead of borrowing `&self` — borrowing
+/// `&self` would make a guard self-referential once stored in a stateful iterator.
+pub struct DiskManager {
+    inner: Arc<DiskManagerInner>,
+}
+
 impl DiskManager {
     pub fn new(block_size: usize, capacity_blocks: usize) -> Result<Self, WalError> {
         Ok(Self {
-            block_size,
-            cache: Mutex::new(ClockCache::new(capacity_blocks, block_size)?),
-            cv: Condvar::new(),
+            inner: Arc::new(DiskManagerInner {
+                block_size,
+                cache: Mutex::new(ClockCache::new(capacity_blocks, block_size)?),
+                cv: Condvar::new(),
+            }),
         })
     }
 
@@ -159,6 +173,10 @@ impl DiskManager {
     /// a guard. When every frame is pinned, this blocks on the `Condvar` until an
     /// unpin frees one. The `pread` runs without the lock held; a concurrent miss on
     /// the same block may `pread` twice (last install wins) — harmless redundancy.
+    ///
+    /// The returned guard is `'static`: it holds an `Arc` clone of the pool, not a
+    /// borrow of `self`, so it can be stored in a stateful iterator (e.g.
+    /// `NormalBlockIter<PinGuard>`) without self-reference.
     ///
     /// Deadlock discipline: do **not** hold a `PinGuard` on this manager across a
     /// `read_block` that may block (`get` single-block is safe; `scan` must drop the
@@ -169,16 +187,16 @@ impl DiskManager {
         seg_id: u32,
         fd: RawFd,
         block_idx: u64,
-    ) -> Result<PinGuard<'_>, WalError> {
+    ) -> Result<PinGuard, WalError> {
         let key = BlockKey::new(seg_id, block_idx);
-        let off = (block_idx as i64) * (self.block_size as i64);
-        let mut cache = self.cache.lock().unwrap();
+        let off = (block_idx as i64) * (self.inner.block_size as i64);
+        let mut cache = self.inner.cache.lock().unwrap();
         loop {
             if let Some(idx) = cache.pin_hit(key) {
                 let (ptr, len) = cache.buf_ptr(idx);
                 drop(cache);
                 return Ok(PinGuard {
-                    dm: self,
+                    inner: Arc::clone(&self.inner),
                     idx,
                     ptr,
                     len,
@@ -197,14 +215,14 @@ impl DiskManager {
                         unsafe { std::slice::from_raw_parts_mut(buf_ptr, buf_len) },
                         off,
                     );
-                    let mut cache = self.cache.lock().unwrap();
+                    let mut cache = self.inner.cache.lock().unwrap();
                     match res {
                         Ok(()) => {
                             cache.commit_load(idx, key);
                             let (ptr, len) = cache.buf_ptr(idx);
                             drop(cache);
                             return Ok(PinGuard {
-                                dm: self,
+                                inner: Arc::clone(&self.inner),
                                 idx,
                                 ptr,
                                 len,
@@ -216,7 +234,7 @@ impl DiskManager {
                             let became_zero = cache.unpin(idx);
                             drop(cache);
                             if became_zero {
-                                self.cv.notify_all();
+                                self.inner.cv.notify_all();
                             }
                             return Err(e);
                         }
@@ -224,59 +242,66 @@ impl DiskManager {
                 }
                 None => {
                     // All frames pinned — release the lock and wait for an unpin.
-                    cache = self.cv.wait(cache).unwrap();
+                    cache = self.inner.cv.wait(cache).unwrap();
                 }
             }
         }
     }
 
     pub fn block_size(&self) -> usize {
-        self.block_size
+        self.inner.block_size
     }
 }
 
-/// Borrowed, pinned handle to a cached block's bytes. `Drop` unpins the frame
-/// (notifying blocked readers if it becomes evictable). The bytes are safe to
-/// read for the guard's lifetime: the frame is pinned (`pin_count > 0`), so it
-/// cannot be evicted or overwritten while this guard exists.
-pub struct PinGuard<'a> {
-    dm: &'a DiskManager,
+/// Owned (`'static`), pinned handle to a cached block's bytes. `Drop` unpins the
+/// frame (notifying blocked readers if it becomes evictable). The bytes are safe
+/// to read for the guard's lifetime: the frame is pinned (`pin_count > 0`), so it
+/// cannot be evicted or overwritten while this guard exists, and the pool (`Arc`
+/// clone) is kept alive until the guard drops.
+///
+/// `'static` (holds an `Arc` to the pool, not a borrow of `&self`) means a guard
+/// can be stored in a stateful iterator without self-reference — see
+/// `NormalBlockIter<PinGuard>`.
+pub struct PinGuard {
+    inner: Arc<DiskManagerInner>,
     idx: usize,
     ptr: *const u8,
     len: usize,
 }
 
-impl PinGuard<'_> {
+impl PinGuard {
     /// Frame buffer pointer — lets tests assert two reads hit the same frame.
     pub fn as_ptr(&self) -> *const u8 {
         self.ptr
     }
 }
 
-impl Deref for PinGuard<'_> {
+impl Deref for PinGuard {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
         // SAFETY (see `wal-design.md` §Read path + `tradeoffs §22b`): `ptr`/`len`
         // come from a `Frame`'s `AlignedMem` in a fixed-length `Box<[Frame]>` (no
-        // realloc → the allocation is stable for the pool's life). The frame was
-        // pinned before this guard was built (`pin_count > 0`), so no eviction or
-        // overwrite can touch these bytes while the guard lives. The only writer is
-        // a miss-load `pread`, which runs on a frame whose mapping was removed under
-        // the lock and whose pin was 0 at eviction — so it never overlaps a live
-        // guard. Multiple guards to the same frame share `&[u8]` (read-only), which
-        // is sound.
+        // realloc → the allocation is stable for the pool's life). The pool is kept
+        // alive by the `Arc` in this guard, and the frame is pinned (`pin_count >
+        // 0`), so no eviction or overwrite can touch these bytes while the guard
+        // lives. The only writer is a miss-load `pread`, which runs on a frame whose
+        // mapping was removed under the lock and whose pin was 0 at eviction — so it
+        // never overlaps a live guard. Multiple guards to the same frame share
+        // `&[u8]` (read-only), which is sound.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
-impl Drop for PinGuard<'_> {
+impl Drop for PinGuard {
     fn drop(&mut self) {
-        let mut cache = self.dm.cache.lock().unwrap();
+        // Safe: `inner` is a live `Arc` to the pool; unpin + notify is plain pool
+        // bookkeeping. (The `unsafe` is confined to `Deref`'s raw-pointer read.)
+        let mut cache = self.inner.cache.lock().unwrap();
         let became_zero = cache.unpin(self.idx);
         drop(cache);
         if became_zero {
-            self.dm.cv.notify_all();
+            self.inner.cv.notify_all();
         }
     }
 }
@@ -341,5 +366,20 @@ mod tests {
         assert_eq!(c.find_victim(), Some(0));
         c.frames[0].ref_bit = true; // re-arm
         assert_eq!(c.find_victim(), Some(0));
+    }
+
+    // Compile-time proof: PinGuard is `'static` (holds an `Arc`, no lifetime
+    // param) and derefs to `[u8]`, so it is a valid zero-copy storage type for
+    // the generic block iterator — no self-reference, no materialization.
+    #[test]
+    fn pin_guard_is_static_and_derefs() {
+        fn needs_static<T: 'static>() {}
+        fn needs_deref<B: std::ops::Deref<Target = [u8]>>() {}
+
+        needs_static::<PinGuard>();
+        needs_deref::<PinGuard>();
+        // NormalBlockIter<PinGuard> is a well-formed type.
+        fn _accepts<B: std::ops::Deref<Target = [u8]>>(_: &crate::iterators::block_iter::NormalBlockIter<B>) {}
+        let _f: fn(&crate::iterators::block_iter::NormalBlockIter<PinGuard>) = _accepts;
     }
 }

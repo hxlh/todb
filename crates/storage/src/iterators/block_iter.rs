@@ -1,4 +1,5 @@
 use core::fmt;
+use std::ops::Deref;
 
 use bytes::Bytes;
 use tracing::debug;
@@ -27,9 +28,15 @@ impl<'a> AsArray<'a> for RawEntry<'a> {
     }
 }
 
+/// Block-format iterator, generic over the block's storage type `B`.
+///
+/// - `B = Bytes`: owned, `'static` — the LSM path. `from_block(Bytes)` stores it
+///   directly (a move, zero-copy).
+/// - `B = PinGuard`: a pinned cache frame (`'static` via `Arc` to the pool),
+///   zero-copy — held directly with no materialization.
 #[allow(dead_code)]
-pub struct NormalBlockIter {
-    block: Bytes,
+pub struct NormalBlockIter<B: Deref<Target = [u8]> = Bytes> {
+    block: B,
     key_offsets: Vec<usize>,
     values_offsets: Vec<usize>,
     count: usize,
@@ -37,8 +44,8 @@ pub struct NormalBlockIter {
     curr: Option<usize>,
 }
 
-impl NormalBlockIter {
-    pub fn new(block: Bytes) -> StorageResult<Self> {
+impl<B: Deref<Target = [u8]>> NormalBlockIter<B> {
+    pub fn new(block: B) -> StorageResult<Self> {
         let mut s = Self {
             block,
             key_offsets: vec![],
@@ -54,15 +61,16 @@ impl NormalBlockIter {
     fn parse_header(&mut self) {
         self.reset();
 
+        let block = self.block.deref();
         let mut start = 0;
         // parse count
-        let buf = &self.block[start..start + size_of::<u32>()];
+        let buf = &block[start..start + size_of::<u32>()];
         let count = u32::from_be_bytes(buf.try_into().unwrap()) as usize;
         start += size_of::<u32>();
 
         // parse key offsets (count + 1, last is sentinel)
         for _ in 0..=count {
-            let buf = &self.block[start..start + size_of::<u32>()];
+            let buf = &block[start..start + size_of::<u32>()];
             let offset = u32::from_be_bytes(buf.try_into().unwrap()) as usize;
             self.key_offsets.push(offset);
             start += size_of::<u32>();
@@ -70,7 +78,7 @@ impl NormalBlockIter {
 
         // parse values offsets (count + 1, last is sentinel)
         for _ in 0..=count {
-            let buf = &self.block[start..start + size_of::<u32>()];
+            let buf = &block[start..start + size_of::<u32>()];
             let offset = u32::from_be_bytes(buf.try_into().unwrap()) as usize;
             self.values_offsets.push(offset);
             start += size_of::<u32>();
@@ -87,12 +95,12 @@ impl NormalBlockIter {
         self.values_offsets.clear();
     }
 }
-impl IterBase for NormalBlockIter {
+impl<B: Deref<Target = [u8]>> IterBase for NormalBlockIter<B> {
     type Key<'a> = RowKey<'a>;
     type Value<'a> = RawEntry<'a>;
 }
 
-impl IterRead for NormalBlockIter {
+impl<B: Deref<Target = [u8]>> IterRead for NormalBlockIter<B> {
     fn valid(&self) -> bool {
         self.curr.is_some()
     }
@@ -112,7 +120,7 @@ impl IterRead for NormalBlockIter {
     }
 }
 
-impl ForwardIter for NormalBlockIter {
+impl<B: Deref<Target = [u8]>> ForwardIter for NormalBlockIter<B> {
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.curr = (self.count > 0).then_some(0);
         Ok(())
@@ -142,7 +150,7 @@ impl ForwardIter for NormalBlockIter {
     }
 }
 
-impl ReverseIter for NormalBlockIter {
+impl<B: Deref<Target = [u8]>> ReverseIter for NormalBlockIter<B> {
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.curr = (self.count > 0).then_some(self.count - 1);
         Ok(())
@@ -172,7 +180,7 @@ impl ReverseIter for NormalBlockIter {
     }
 }
 
-impl fmt::Display for NormalBlockIter {
+impl<B: Deref<Target = [u8]>> fmt::Display for NormalBlockIter<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let _ = f.write_fmt(format_args!(
             r#"
@@ -193,8 +201,10 @@ BlockIter
 
 // BlockIter serves as both the default index block format and data block format.
 // Future formats implement these traits independently.
-impl IndexBlockIter for NormalBlockIter {
-    fn from_block(block: bytes::Bytes) -> StorageResult<Self> {
+impl<B: Deref<Target = [u8]>> IndexBlockIter for NormalBlockIter<B> {
+    type Block = B;
+
+    fn from_block(block: B) -> StorageResult<Self> {
         NormalBlockIter::new(block)
     }
 
@@ -206,8 +216,10 @@ impl IndexBlockIter for NormalBlockIter {
     }
 }
 
-impl DataBlockIter for NormalBlockIter {
-    fn from_block(block: bytes::Bytes) -> StorageResult<Self> {
+impl<B: Deref<Target = [u8]>> DataBlockIter for NormalBlockIter<B> {
+    type Block = B;
+
+    fn from_block(block: B) -> StorageResult<Self> {
         NormalBlockIter::new(block)
     }
 }
@@ -281,6 +293,20 @@ mod tests {
         let mut iter = NormalBlockIter::new(block).unwrap();
         iter.seek_to_first().unwrap();
         iter
+    }
+
+    // Generic storage: NormalBlockIter<B> is not pinned to Bytes. A Vec-backed
+    // block (the shape a borrowed WAL PinGuard guard will take) parses and
+    // iterates identically. De-risks the future zero-copy borrowed-guard path.
+    #[test]
+    fn test_generic_storage_vec() {
+        let block = build_block(&[(b"apple", b"v1"), (b"banana", b"v2")]).to_vec();
+        let mut iter: NormalBlockIter<Vec<u8>> = NormalBlockIter::new(block).unwrap();
+        iter.seek_to_first().unwrap();
+        assert_eq!(iter.key().unwrap(), key(b"apple"));
+        assert_eq!(raw_entry_bytes(iter.value().unwrap()), b"v1");
+        iter.next().unwrap();
+        assert_eq!(iter.key().unwrap(), key(b"banana"));
     }
 
     #[test]

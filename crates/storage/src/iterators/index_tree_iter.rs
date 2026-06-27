@@ -33,6 +33,7 @@ where
     R: BlockReader,
     I: IndexBlockIter,
     for<'a> I::Value<'a>: AsArray<'a>,
+    for<'a> R::Guard<'a>: Into<I::Block>,
 {
     pub fn new(reader: Arc<R>, footer: &SstFooter, option: &SstOption) -> StorageResult<Self> {
         let s = Self {
@@ -63,6 +64,7 @@ where
     R: BlockReader,
     I: IndexBlockIter,
     for<'a> I::Value<'a>: AsArray<'a>,
+    for<'a> R::Guard<'a>: Into<I::Block>,
 {
     /// Descend root→leaf, positioning each level at the first key >= target
     /// (lower bound). Direction-agnostic block location; both forward and
@@ -75,7 +77,7 @@ where
         self.reset();
 
         let root_block = self.reader.read_block(&self.root_position)?;
-        let mut root_iter = IndexEntryDecodeIter::new(I::from_block(root_block)?);
+        let mut root_iter = IndexEntryDecodeIter::new(I::from_block(root_block.into())?);
         root_iter.seek_lower_bound(target)?;
         self.index_iters.push(root_iter);
 
@@ -103,7 +105,7 @@ where
                 .into();
 
             let block = self.reader.read_block(&next_pos)?;
-            let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
+            let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block.into())?);
             child_iter.seek_lower_bound(target)?;
             self.index_iters.push(child_iter);
             self.curr_iter_idx += 1;
@@ -119,6 +121,7 @@ where
     R: BlockReader,
     I: IndexBlockIter + ForwardIter,
     for<'a> I::Value<'a>: AsArray<'a>,
+    for<'a> R::Guard<'a>: Into<I::Block>,
 {
     /// Descend root→leaf for forward `seek_to_first`, positioning each level
     /// at its first entry. Unlike [`locate`](Self::locate) there is no target
@@ -130,7 +133,7 @@ where
         self.reset();
 
         let root_block = self.reader.read_block(&self.root_position)?;
-        let mut root_iter = IndexEntryDecodeIter::new(I::from_block(root_block)?);
+        let mut root_iter = IndexEntryDecodeIter::new(I::from_block(root_block.into())?);
         root_iter.seek_to_first()?;
         self.index_iters.push(root_iter);
 
@@ -150,7 +153,7 @@ where
                 .into();
 
             let block = self.reader.read_block(&next_pos)?;
-            let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
+            let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block.into())?);
             child_iter.seek_to_first()?;
             self.index_iters.push(child_iter);
             self.curr_iter_idx += 1;
@@ -183,7 +186,7 @@ where
                 .into();
 
             let block = self.reader.read_block(&next_pos)?;
-            let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
+            let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block.into())?);
             child_iter.seek_to_first()?;
             self.index_iters.push(child_iter);
             self.curr_iter_idx += 1;
@@ -203,6 +206,7 @@ where
     R: BlockReader,
     I: IndexBlockIter + ReverseIter,
     for<'a> I::Value<'a>: AsArray<'a>,
+    for<'a> R::Guard<'a>: Into<I::Block>,
 {
     /// Descend root→leaf for reverse `seek_to_first` (which positions at the
     /// largest key, i.e. seek_to_last). Each level uses `ReverseIter::seek_to_first`
@@ -214,7 +218,7 @@ where
         self.reset();
 
         let root_block = self.reader.read_block(&self.root_position)?;
-        let mut root_iter = IndexEntryDecodeIter::new(I::from_block(root_block)?);
+        let mut root_iter = IndexEntryDecodeIter::new(I::from_block(root_block.into())?);
         root_iter.seek_to_first()?;
         self.index_iters.push(root_iter);
 
@@ -234,7 +238,7 @@ where
                 .into();
 
             let block = self.reader.read_block(&next_pos)?;
-            let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
+            let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block.into())?);
             child_iter.seek_to_first()?;
             self.index_iters.push(child_iter);
             self.curr_iter_idx += 1;
@@ -268,7 +272,7 @@ where
                 .into();
 
             let block = self.reader.read_block(&next_pos)?;
-            let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block)?);
+            let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block.into())?);
             child_iter.seek_to_first()?;
             self.index_iters.push(child_iter);
             self.curr_iter_idx += 1;
@@ -325,6 +329,7 @@ where
     R: BlockReader,
     I: IndexBlockIter + ForwardIter,
     for<'a> I::Value<'a>: AsArray<'a>,
+    for<'a> R::Guard<'a>: Into<I::Block>,
 {
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.inner_seek_to_first()
@@ -344,6 +349,7 @@ where
     R: BlockReader,
     I: IndexBlockIter + ReverseIter,
     for<'a> I::Value<'a>: AsArray<'a>,
+    for<'a> R::Guard<'a>: Into<I::Block>,
 {
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.inner_seek_to_last()

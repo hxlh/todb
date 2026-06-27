@@ -32,6 +32,7 @@ where
     R: BlockReader,
     I: IndexBlockIter,
     for<'a> I::Value<'a>: AsArray<'a>,
+    for<'a> R::Guard<'a>: Into<I::Block>,
     D: DataBlockIter,
 {
     pub fn new(reader: Arc<R>, footer: SstFooter, option: SstOption) -> StorageResult<Self> {
@@ -49,7 +50,8 @@ where
     R: BlockReader,
     I: IndexBlockIter,
     D: DataBlockIter,
-    for<'a> I::Value<'a>: AsArray<'a>
+    for<'a> I::Value<'a>: AsArray<'a>,
+    for<'a> R::Guard<'a>: Into<D::Block>,
 {
     /// Load and decode the data block at the given block position.
     /// Callers obtain the Position from `value()` on the index iterator.
@@ -58,7 +60,7 @@ where
             StorageError::InvalidValue("index iter valid but value is none".into())
         })?;
         let block = self.reader.read_block(&pos)?;
-        D::from_block(block)
+        D::from_block(block.into())
     }
 }
 
@@ -96,8 +98,10 @@ where
     R: BlockReader,
     I: IndexBlockIter + for<'a> ForwardIter<Key<'a> = D::Key<'a>>,
     for<'a> I::Value<'a>: AsArray<'a>,
+    for<'a> R::Guard<'a>: Into<I::Block>,
     D: DataBlockIter + ForwardIter,
     for<'a> D::Value<'a>: AsArray<'a>,
+    for<'a> R::Guard<'a>: Into<D::Block>,
 {
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.index_iter.seek_to_first()?;
@@ -145,6 +149,8 @@ where
     I: IndexBlockIter  + ReverseIter,
     for<'a> I::Value<'a>: AsArray<'a>,
     for<'a> I: IterBase<Key<'a> = D::Key<'a>>,
+    for<'a> R::Guard<'a>: Into<I::Block>,
+    for<'a> R::Guard<'a>: Into<D::Block>,
 {
     fn seek_to_first(&mut self) -> StorageResult<()> {
         self.index_iter.seek_to_first()?;

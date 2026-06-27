@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{ops::Deref, path::Path, sync::Arc};
 
 use bytes::Bytes;
 
@@ -97,14 +97,31 @@ impl BlockWriter for FileBlockWriter {
 }
 
 /// Abstraction over block read sources (file, memory, etc.).
+///
+/// Generic Associated Type (GAT) allows implementations to return either:
+/// - Owned data (`Bytes`) for uncached/buffered I/O
+/// - Borrowed data (`PinGuard<'_>`) for zero-copy cached reads
+///
+/// Upper layers only care that `Guard` derefs to `&[u8]`. The block-format
+/// iterator ([`crate::iterators::block_iter::NormalBlockIter`]) is generic over
+/// this storage type, so it stores the guard directly — `Bytes` for LSM is a
+/// zero-copy move; a future borrowed `PinGuard` is held without copy too (the
+/// self-referential lifetime for the borrowed case is a follow-up concern).
 pub trait BlockReader {
-    fn read_block(&self, position: &Position) -> StorageResult<Bytes>;
+    /// Guard type that derefs to block bytes.
+    /// - For cached reads: `PinGuard<'a>` (zero-copy, must unpin on drop)
+    /// - For uncached reads: `Bytes` (owned, no lifetime constraint)
+    type Guard<'a>: Deref<Target = [u8]> where Self: 'a;
+
+    fn read_block(&self, position: &Position) -> StorageResult<Self::Guard<'_>>;
     fn block_size(&self) -> usize;
 }
 
 /// Allow Arc<R> to be used wherever R: BlockReader is expected.
-impl<R: BlockReader> BlockReader for std::sync::Arc<R> {
-    fn read_block(&self, position: &Position) -> StorageResult<Bytes> {
+impl<R: BlockReader> BlockReader for Arc<R> {
+    type Guard<'a> = R::Guard<'a> where Self: 'a;
+
+    fn read_block(&self, position: &Position) -> StorageResult<Self::Guard<'_>> {
         (**self).read_block(position)
     }
     fn block_size(&self) -> usize {
@@ -126,6 +143,8 @@ impl InMemoryBlockReader {
 }
 
 impl BlockReader for InMemoryBlockReader {
+    type Guard<'a> = Bytes;
+
     fn read_block(&self, position: &Position) -> StorageResult<Bytes> {
         let start = position.offset as usize;
         if start > self.buf.len() {
@@ -145,7 +164,7 @@ impl BlockReader for InMemoryBlockReader {
 /// File-based block reader for production.
 /// Reads fixed-size blocks via positional reads (`pread`) — thread-safe, no seek.
 pub struct FileBlockReader {
-    file: std::sync::Arc<std::fs::File>,
+    file: Arc<std::fs::File>,
     block_size: usize,
 }
 
@@ -153,7 +172,7 @@ impl FileBlockReader {
     pub fn open(path: &Path, block_size: usize) -> StorageResult<Self> {
         let file = std::fs::File::open(path)?;
         Ok(Self {
-            file: std::sync::Arc::new(file),
+            file: Arc::new(file),
             block_size,
         })
     }
@@ -161,13 +180,15 @@ impl FileBlockReader {
     /// Build a reader over an already-opened file (used after reading the footer).
     pub fn from_file(file: std::fs::File, block_size: usize) -> Self {
         Self {
-            file: std::sync::Arc::new(file),
+            file: Arc::new(file),
             block_size,
         }
     }
 }
 
 impl BlockReader for FileBlockReader {
+    type Guard<'a> = Bytes;
+
     fn read_block(&self, position: &Position) -> StorageResult<Bytes> {
         use std::os::unix::fs::FileExt;
         let mut buf = vec![0u8; self.block_size];
@@ -257,6 +278,22 @@ mod tests {
 
         assert_eq!(b1.as_ref(), &[0, 1, 2, 3]);
         assert_eq!(b2.as_ref(), &[3, 2, 1, 0]);
+        Ok(())
+    }
+
+    // GAT: Arc<R> wrapper implements BlockReader.
+    #[test]
+    fn test_arc_block_reader() -> StorageResult<()> {
+        let block_size = 4;
+        let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let reader = Arc::new(InMemoryBlockReader::new(
+            Bytes::from(data),
+            block_size,
+        ));
+
+        let guard = reader.read_block(&Position { offset: 0 })?;
+        assert_eq!(&*guard, &[1, 2, 3, 4]);
+        assert_eq!(reader.block_size(), 4);
         Ok(())
     }
 }
