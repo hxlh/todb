@@ -163,37 +163,47 @@ where
     }
     fn inner_next(&mut self) -> StorageResult<()> {
         let last_index_level = self.last_index_level();
+        if self.index_iters.is_empty() {
+            return Ok(());
+        }
 
-        while self.curr_iter_idx <= last_index_level {
-            let curr_iter = &mut self.index_iters[self.curr_iter_idx];
+        // Phase 1 — advance the current level by one. If it is exhausted, pop it
+        // and advance its parent; repeat up the tree until some level has a next
+        // entry (or the root is exhausted, ending iteration).
+        loop {
+            let curr = self.curr_iter_idx;
+            let curr_iter = &mut self.index_iters[curr];
             curr_iter.next()?;
-            if !curr_iter.valid() {
-                self.index_iters.remove(self.curr_iter_idx);
-                if self.curr_iter_idx == 0 {
-                    break;
-                }
-                self.curr_iter_idx -= 1;
-                continue;
-            }
-
-            if self.curr_iter_idx == last_index_level {
+            if curr_iter.valid() {
                 break;
             }
+            self.index_iters.remove(curr);
+            if curr == 0 {
+                return Ok(());
+            }
+            self.curr_iter_idx = curr - 1;
+        }
 
-            let next_pos: Position = curr_iter
+        // Phase 2 — the level now holding a next entry may be above the leaf.
+        // Re-descend to the leaf through FIRST entries (seek_to_first), mirroring
+        // inner_seek_to_first. Each freshly-read child is already at its first
+        // entry; advancing it here would skip that entry (and its whole subtree),
+        // so never call next() on a just-pushed level.
+        while self.curr_iter_idx < last_index_level {
+            let next_pos: Position = self.index_iters[self.curr_iter_idx]
                 .value()
                 .ok_or_else(|| StorageError::InvalidValue("iter values not exists".into()))?
                 .into();
-
             let block = self.reader.read_block(&next_pos)?;
             let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block.into())?);
             child_iter.seek_to_first()?;
+            if !child_iter.valid() {
+                return Err(StorageError::InvalidValue(
+                    "corrupt index: empty block during next descent".into(),
+                ));
+            }
             self.index_iters.push(child_iter);
             self.curr_iter_idx += 1;
-
-            if self.curr_iter_idx == last_index_level {
-                break;
-            }
         }
         Ok(())
     }
@@ -249,37 +259,48 @@ where
 
     fn inner_prev(&mut self) -> StorageResult<()> {
         let last_index_level = self.last_index_level();
+        if self.index_iters.is_empty() {
+            return Ok(());
+        }
 
-        while self.curr_iter_idx <= last_index_level {
-            let curr_iter = &mut self.index_iters[self.curr_iter_idx];
+        // Phase 1 — step the current level backward (`ReverseIter::next`). If it
+        // is exhausted (at the block's first/smallest entry), pop it and step its
+        // parent backward; repeat up the tree until some level has a previous
+        // entry (or the root is exhausted, ending iteration).
+        loop {
+            let curr = self.curr_iter_idx;
+            let curr_iter = &mut self.index_iters[curr];
             curr_iter.next()?;
-            if !curr_iter.valid() {
-                self.index_iters.remove(self.curr_iter_idx);
-                if self.curr_iter_idx == 0 {
-                    break;
-                }
-                self.curr_iter_idx -= 1;
-                continue;
-            }
-
-            if self.curr_iter_idx == last_index_level {
+            if curr_iter.valid() {
                 break;
             }
+            self.index_iters.remove(curr);
+            if curr == 0 {
+                return Ok(());
+            }
+            self.curr_iter_idx = curr - 1;
+        }
 
-            let next_pos: Position = curr_iter
+        // Phase 2 — re-descend to the leaf through LAST entries
+        // (`ReverseIter::seek_to_first`), mirroring inner_seek_to_last. Each
+        // freshly-read child is already at its last entry; stepping it here
+        // would skip that entry (and its whole subtree), so never call next()
+        // on a just-pushed level. (Symmetric to inner_next's forward descent.)
+        while self.curr_iter_idx < last_index_level {
+            let next_pos: Position = self.index_iters[self.curr_iter_idx]
                 .value()
                 .ok_or_else(|| StorageError::InvalidValue("iter values not exists".into()))?
                 .into();
-
             let block = self.reader.read_block(&next_pos)?;
             let mut child_iter = IndexEntryDecodeIter::new(I::from_block(block.into())?);
             child_iter.seek_to_first()?;
+            if !child_iter.valid() {
+                return Err(StorageError::InvalidValue(
+                    "corrupt index: empty block during prev descent".into(),
+                ));
+            }
             self.index_iters.push(child_iter);
             self.curr_iter_idx += 1;
-
-            if self.curr_iter_idx == last_index_level {
-                break;
-            }
         }
         Ok(())
     }

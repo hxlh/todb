@@ -142,14 +142,33 @@ impl<S: SstWriter> SstBuilder<S> {
 
         self.flush_data_block()?;
 
-        // Flush every existing index level bottom-up. flush_index_block may push
-        // new higher-level builders, but the loop range is intentionally fixed to
-        // the pre-flush snapshot — those new builders are already flushed
-        // recursively and their last entry becomes the new root.
-        for level in 0..self.index_builders.len() {
+        // Flush every index level bottom-up. The loop range is fixed to the
+        // pre-flush builder count; flush_index_block promotes a summary entry to
+        // the next level and may recursively create new higher levels, which are
+        // flushed in turn by that recursion.
+        let pre_flush_levels = self.index_builders.len();
+        for level in 0..pre_flush_levels {
             if !self.index_builders[level].is_empty() {
                 self.flush_index_block(level)?;
             }
+        }
+
+        // The loop above never visits a level created during flushing (its range
+        // was fixed to the pre-flush count). If that new topmost level
+        // accumulated more than one entry, those entries are sibling top-level
+        // blocks with no parent block above them — `root_position` below would
+        // reach only the last, orphaning the rest and corrupting any tree of
+        // height >= 4. Flush the topmost into a single root block; the promoted
+        // summary becomes the sole entry of a new topmost, so one flush suffices
+        // (the topmost never exceeds block capacity — add_index_entry flushes on
+        // would_exceed).
+        if self
+            .index_builders
+            .last()
+            .map_or(false, |b| b.entry_count() > 1)
+        {
+            let top = self.index_builders.len() - 1;
+            self.flush_index_block(top)?;
         }
 
         let height = self.index_builders.len() as u32;

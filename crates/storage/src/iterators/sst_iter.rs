@@ -282,6 +282,73 @@ mod tests {
         assert!(!iter.valid(), "expected invalid after last entry");
     }
 
+    // Regression: a deep index tree (height >= 4) must be fully reachable.
+    // Two latent bugs once hid here, both uncovered only by tall trees:
+    //  - SstBuilder::finish left the topmost index level unflushed when it held
+    //    >1 entry, so `root_position` reached only the last top-level block and
+    //    seek_to_first landed near the END of the key space (keys 32..39 of 40)
+    //    instead of key 0.
+    //  - IndexTreeIter::inner_next, when a forward step exhausted the leaf AND
+    //    its parent in one call, re-descended by calling next() on a freshly
+    //    seek_to_first'd child — skipping that child's first entry (and its
+    //    whole subtree), dropping entries mid-scan.
+    // block_size=64 + 40 entries forces height=6 here. A clean full scan of all
+    // keys in order proves both the root reaches key 0 and no subtree is skipped.
+    #[test]
+    fn test_deep_tree_full_scan_reaches_all_keys() {
+        init_tracing();
+        let n = 40u64;
+        let mut iter = make_iter(n, 64);
+        // height sanity: this shape must actually be a tall tree, else the test
+        // stops exercising the regressions it guards.
+        let (bytes, footer, _option) = build_sst(n, 64);
+        assert!(
+            footer.tree_height >= 4,
+            "expected deep tree, got height={}",
+            footer.tree_height
+        );
+        let _ = bytes;
+
+        iter.seek_to_first().unwrap();
+        assert_eq!(iter.key().unwrap(), (&make_key(0)).into(), "seek_to_first must land on key 0");
+        for i in 0..n {
+            assert!(iter.valid(), "expected valid at i={}", i);
+            assert_eq!(iter.key().unwrap(), (&make_key(i)).into(), "key mismatch at i={}", i);
+            assert_eq!(iter.value().unwrap().as_array(), make_value(i).as_ref());
+            iter.next().unwrap();
+        }
+        assert!(!iter.valid(), "expected invalid after last entry");
+    }
+
+    // seek 精确命中
+    // Regression (reverse): mirror of test_deep_tree_full_scan_reaches_all_keys
+    // for the backward path. IndexTreeIter::inner_prev had the same multi-level-
+    // pop skip bug as inner_next — a reverse scan over a deep tree dropped large
+    // key ranges (e.g. [39,38,37,36,33,32,1,0] instead of all 40 descending).
+    #[test]
+    fn test_reverse_deep_tree_full_scan_reaches_all_keys() {
+        use crate::iterators::storage_iter::ReverseIter;
+        init_tracing();
+        let n = 40u64;
+        let (bytes, footer, _option) = build_sst(n, 64);
+        assert!(footer.tree_height >= 4, "expected deep tree");
+        let reader = Arc::new(InMemoryBlockReader::new(Bytes::from(bytes), 64));
+        let mut iter = SstIter::<_, NormalBlockIter, DataEntryDecodeIter<NormalBlockIter>>::new(
+            reader, footer, SstOption::default().block_size(64),
+        )
+        .unwrap();
+        ReverseIter::seek_to_first(&mut iter).unwrap();
+        assert_eq!(iter.key().unwrap(), (&make_key(n - 1)).into(), "reverse seek must land on last key");
+        let mut got: Vec<u64> = Vec::new();
+        while iter.valid() {
+            let k = iter.key().unwrap();
+            got.push(u64::from_be_bytes(k.as_array()[..8].try_into().unwrap()));
+            ReverseIter::next(&mut iter).unwrap();
+        }
+        let expect: Vec<u64> = (0..n).rev().collect();
+        assert_eq!(got, expect);
+    }
+
     // seek 精确命中
     #[test]
     fn test_seek_exact_match() {
