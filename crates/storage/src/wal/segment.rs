@@ -44,19 +44,20 @@ pub(crate) fn open_fd(path: &Path, o_direct: bool) -> Result<RawFd, WalError> {
 }
 
 impl Segment {
-    /// Create + open a segment's `.log` (preallocated to `segment_size`) and `.meta`
-    /// (header double-write target). The `.idx` SST is not opened here — the flush
-    /// thread seals it at segment close and `WalIndexReader` opens a read fd on demand.
-    /// `o_direct = false` lets tests run on tmpfs/CI; production uses `true`
-    /// (4 KiB-aligned I/O bypassing the page cache).
-    pub fn create(
+    /// Open a segment; create it if it doesn't exist.
+    /// Returns `(segment, was_created)` where `was_created = true` means the segment
+    /// was newly created and needs initialization (fallocate + initial .meta write).
+    pub fn open(
         dir: &Path,
         seg_id: u32,
         segment_size: usize,
         block_size: usize,
         o_direct: bool,
-    ) -> Result<Self, WalError> {
-        let log_fd = open_fd(&log_path(dir, seg_id), o_direct)?;
+    ) -> Result<(Self, bool), WalError> {
+        let log_p = log_path(dir, seg_id);
+        let exists = std::fs::metadata(&log_p).is_ok();
+
+        let log_fd = open_fd(&log_p, o_direct)?;
         let meta_fd = open_fd(&meta_path(dir, seg_id), o_direct)?;
         let seg = Self {
             log_fd,
@@ -65,8 +66,12 @@ impl Segment {
             segment_size,
             block_size,
         };
-        seg.fallocate_log(0, segment_size as i64)?;
-        Ok(seg)
+
+        if !exists {
+            seg.fallocate_log(0, segment_size as i64)?;
+        }
+
+        Ok((seg, !exists))
     }
 
     pub fn seg_id(&self) -> u32 {
@@ -195,7 +200,7 @@ mod tests {
 
     // 测试用 o_direct=false（兼容 tmpfs / CI）；production 用 true。
     fn make_seg(dir: &Path, segment_size: usize) -> Segment {
-        Segment::create(dir, 0, segment_size, 4096, false).unwrap()
+        Segment::open(dir, 0, segment_size, 4096, false).unwrap().0
     }
 
     #[test]

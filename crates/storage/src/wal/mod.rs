@@ -8,7 +8,7 @@ pub mod aligned;
 pub mod buffer;
 pub mod config;
 pub mod disk;
-pub mod facade;
+pub mod r#impl;
 pub mod frame;
 pub mod index;
 pub mod index_reader;
@@ -23,7 +23,7 @@ pub use buffer::{STATE_ACTIVE, STATE_FULL, WalBuffer, pack, unpack};
 pub use config::WalConfig;
 pub use disk::{DiskManager, PinGuard};
 pub use error::WalError;
-pub use facade::Wal;
+pub use r#impl::Wal;
 pub use frame::{DecodedFrame, HEADER_LEN, encode};
 pub use index::{
     IDX_HEADER_LEN, IdxHeader, decode_offset_len, encode_offset_len, idx_path, key_to_lsn,
@@ -31,6 +31,6 @@ pub use index::{
 };
 pub use index_reader::WalIndexReader;
 pub use lsn::{Lsn, LsnRange};
-pub use odirect_writer::{ODirectBlockWriter, ODirectSstWriter};
+pub use odirect_writer::{SegmentIndexBlockWriter, ODirectSstWriter};
 pub use record::{Record, RecordRef};
 pub use segment::Segment;

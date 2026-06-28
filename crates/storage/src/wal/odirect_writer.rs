@@ -31,13 +31,13 @@ use crate::wal::AlignedMem;
 /// buffer and `pwrite`s it at the next block-aligned offset. No SST/footer
 /// knowledge — callers must hand it `block_size`-padded input (the [`SstWriter`]
 /// contract).
-pub struct ODirectBlockWriter {
+pub struct SegmentIndexBlockWriter {
     fd: RawFd,
     block_size: usize,
     next_offset: u64,
 }
 
-impl ODirectBlockWriter {
+impl SegmentIndexBlockWriter {
     /// `o_direct = true` in production (4 KiB-aligned I/O bypassing the page
     /// cache); `false` for tmpfs/CI.
     pub fn create(path: &Path, block_size: usize, o_direct: bool) -> Result<Self, StorageError> {
@@ -61,7 +61,7 @@ impl ODirectBlockWriter {
     }
 }
 
-impl BlockWriter for ODirectBlockWriter {
+impl BlockWriter for SegmentIndexBlockWriter {
     fn write_block<T: AsRef<[u8]>>(&mut self, data: T) -> StorageResult<Position> {
         let data = data.as_ref();
         debug_assert_eq!(
@@ -80,7 +80,7 @@ impl BlockWriter for ODirectBlockWriter {
     }
 }
 
-impl Drop for ODirectBlockWriter {
+impl Drop for SegmentIndexBlockWriter {
     fn drop(&mut self) {
         // SAFETY: `fd` is a valid open fd owned by `self`; close once on drop.
         // Errors ignored (best-effort cleanup).
@@ -94,19 +94,19 @@ impl Drop for ODirectBlockWriter {
 /// verbatim; the footer is padded to one `block_size` block as
 /// `[body][padding][trailer]` so it survives O_DIRECT's alignment requirement.
 pub struct ODirectSstWriter {
-    inner: ODirectBlockWriter,
+    inner: SegmentIndexBlockWriter,
     block_size: usize,
 }
 
 impl ODirectSstWriter {
-    pub fn new(inner: ODirectBlockWriter, option: &SstOption) -> Self {
+    pub fn new(inner: SegmentIndexBlockWriter, option: &SstOption) -> Self {
         Self {
             inner,
             block_size: option.block_size,
         }
     }
 
-    pub fn into_inner(self) -> ODirectBlockWriter {
+    pub fn into_inner(self) -> SegmentIndexBlockWriter {
         self.inner
     }
 }
@@ -161,7 +161,7 @@ mod tests {
         let path = dir.path().join("f.idx");
         let f = footer();
 
-        let w = ODirectBlockWriter::create(&path, block_size, false).unwrap();
+        let w = SegmentIndexBlockWriter::create(&path, block_size, false).unwrap();
         let mut sst = ODirectSstWriter::new(w, &SstOption::default().block_size(block_size));
         sst.write_footer(&f).unwrap();
         let written = sst.into_inner().file_size();
@@ -199,7 +199,7 @@ mod odirect_true_tests {
             first_key: bytes::Bytes::from_static(b"key0"),
             last_key: bytes::Bytes::from_static(b"key9"),
         };
-        let w = ODirectBlockWriter::create(&path, block_size, true).unwrap();
+        let w = SegmentIndexBlockWriter::create(&path, block_size, true).unwrap();
         let mut sst = ODirectSstWriter::new(w, &SstOption::default().block_size(block_size));
         sst.write_footer(&f).unwrap();
         sst.into_inner().sync_all().unwrap();

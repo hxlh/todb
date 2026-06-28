@@ -84,7 +84,7 @@ fn flush_seals_idx_sst_and_meta_single_segment() {
     wal.close().unwrap();
 
     // `.meta` header: entry_count == n, lsn range covers all appended records.
-    let seg = Segment::create(&path, 0, 1 << 16, block_size, false).unwrap();
+    let (seg, _) = Segment::open(&path, 0, 1 << 16, block_size, false).unwrap();
     let header = seg.read_meta_header().unwrap();
     assert_eq!(header.seg_id, 0);
     assert_eq!(header.min_live_lsn, 0);

@@ -7,6 +7,7 @@
 //! Segment rollover fires when the active segment can no longer hold the next buffer.
 //! See `docs/architecture/wal-design.md` Write Buffer Architecture + Operation Paths.
 
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -16,9 +17,10 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 
+use crate::iterators::ScanIter;
 use crate::wal::segment::{fdatasync_fd, pwrite_all};
 use crate::wal::{
-    HEADER_LEN, IdxHeader, Lsn, ODirectBlockWriter, ODirectSstWriter, STATE_ACTIVE, STATE_FULL,
+    HEADER_LEN, IdxHeader, Lsn, SegmentIndexBlockWriter, ODirectSstWriter, STATE_ACTIVE, STATE_FULL,
     Segment, WalBuffer, WalConfig, WalError, encode, encode_offset_len, idx_path, lsn_to_key, pack,
     unpack,
 };
@@ -34,21 +36,16 @@ const SWAP_WAIT_TIMEOUT: Duration = Duration::from_millis(1);
 const SYNC_POLL_INTERVAL: Duration = Duration::from_micros(200);
 const SYNC_DEADLINE: Duration = Duration::from_secs(30);
 
-/// In-memory routing entry for one on-disk segment. Phase 4a pushes one on every
-/// rollover; Phase 4b reads locate a segment by lsn via the route table.
-struct SegmentRoute {
-    seg_id: u32,
-    /// Lowest live lsn in this segment. Read by the Phase 4b route lookup; written
-    /// here on rollover so the route is authoritative without re-reading `.idx`.
-    #[allow(dead_code)]
-    min_live_lsn: u64,
-    max_live_lsn: AtomicU64,
-    segment: Arc<Segment>,
-}
-
 struct FreePool {
     buffers: Mutex<Vec<Arc<WalBuffer>>>,
     cv: Condvar,
+}
+
+/// Snapshot of all segments: sealed (finished, read via .idx) + active (in-flight, read via memtable).
+struct SegmentState {
+    sealed: Vec<Arc<Segment>>,
+    active_seg: Arc<Segment>,
+    active_mem: Arc<MemTable<Bytes, Bytes>>,
 }
 
 struct Inner {
@@ -58,9 +55,13 @@ struct Inner {
     durable_lsn: AtomicU64,
     swap_lock: Mutex<()>,
     swap_cv: Condvar,
-    routes: RwLock<Vec<Arc<SegmentRoute>>>,
-    stop_flag: AtomicBool,
+
+    segments: RwLock<SegmentState>,
+
     next_seg_id: AtomicU32,
+
+    stop_flag: AtomicBool,
+
     dir: PathBuf,
     config: WalConfig,
 }
@@ -77,12 +78,27 @@ impl Wal {
         config.validate()?;
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
-        let block = config.block_size;
-        let active = ArcSwap::from_pointee(WalBuffer::new(config.buffer_size, block, 0, 0)?);
+        let block_size = config.block_size;
+        let active = ArcSwap::from_pointee(WalBuffer::new(config.buffer_size, block_size, 0, 0)?);
         let free: Vec<Arc<WalBuffer>> = (0..config.buffer_count)
-            .map(|_| WalBuffer::new(config.buffer_size, block, 0, 0).map(Arc::new))
+            .map(|_| WalBuffer::new(config.buffer_size, block_size, 0, 0).map(Arc::new))
             .collect::<Result<_, _>>()?;
         let (tx, rx) = mpsc::channel::<Arc<WalBuffer>>();
+        let (seg0, was_created) = Segment::open(
+            &dir,
+            0,
+            config.segment_size,
+            config.block_size,
+            config.o_direct,
+        )?;
+        let seg0 = Arc::new(seg0);
+
+        // Initialize active segment with entry_count=0 (unsealed marker for recovery)
+        if was_created {
+            let header = IdxHeader::new(0, 0, 0, 0);
+            seg0.write_meta_header_double(&header)?;
+        }
+
         let inner = Arc::new(Inner {
             active,
             free_pool: FreePool {
@@ -93,9 +109,13 @@ impl Wal {
             durable_lsn: AtomicU64::new(0),
             swap_lock: Mutex::new(()),
             swap_cv: Condvar::new(),
-            routes: RwLock::new(Vec::new()),
+            segments: RwLock::new(SegmentState {
+                sealed: Vec::new(),
+                active_seg: seg0,
+                active_mem: Arc::new(MemTable::new()),
+            }),
             stop_flag: AtomicBool::new(false),
-            next_seg_id: AtomicU32::new(0),
+            next_seg_id: AtomicU32::new(1),
             dir,
             config,
         });
@@ -149,6 +169,12 @@ impl Wal {
             buf.in_flight.fetch_sub(1, Ordering::Release);
             return Ok(Lsn(lsn));
         }
+    }
+
+
+    pub fn scan(&self, _range: (Bound<Lsn>, Bound<Lsn>)) -> Result<(), WalError> {
+        // TODO: Phase 4b scan implementation
+        unimplemented!("scan not yet implemented")
     }
 
     /// Block until every lsn claimed so far is durable on disk. Forces the active
@@ -311,21 +337,20 @@ impl Drop for Wal {
 // ---- flush thread (single writer for `.log` append + index MemTable + segment state) ----
 
 struct FlushState {
-    cur_seg: Option<Arc<SegmentRoute>>,
+    cur_seg: Option<Arc<Segment>>,
+    cur_mem: Arc<MemTable<Bytes, Bytes>>,
     seg_written: u64,
-    /// Per-active-segment index accumulator: LSN(big-endian) → (offset,len). Sealed
-    /// to a `.idx` SST at segment close. Single-writer (the flush thread owns it).
-    index_mem: MemTable<Bytes, Bytes>,
     seg_min_lsn: u64,
     seg_max_lsn: u64,
 }
 
 impl FlushState {
-    fn new() -> Self {
+    fn new(inner: &Inner) -> Self {
+        let guard = inner.segments.read().unwrap();
         Self {
-            cur_seg: None,
+            cur_seg: Some(Arc::clone(&guard.active_seg)),
+            cur_mem: Arc::clone(&guard.active_mem),
             seg_written: 0,
-            index_mem: MemTable::new(),
             seg_min_lsn: 0,
             seg_max_lsn: 0,
         }
@@ -334,7 +359,7 @@ impl FlushState {
     /// Flush-thread entry: drain `rx` into `.log` + the index MemTable, then seal the
     /// last segment.
     fn run(inner: Arc<Inner>, rx: Receiver<Arc<WalBuffer>>) {
-        let mut st = FlushState::new();
+        let mut st = FlushState::new(&inner);
         while let Ok(buf) = rx.recv() {
             st.flush_buffer(&inner, &buf);
         }
@@ -375,26 +400,25 @@ impl FlushState {
             }
         }
         pwrite_all(
-            seg.segment.log_fd(),
+            seg.log_fd(),
             &buf.data.as_bytes()[..padded],
             self.seg_written as i64,
         )
         .expect("pwrite .log");
-        fdatasync_fd(seg.segment.log_fd()).expect("fdatasync .log");
+        fdatasync_fd(seg.log_fd()).expect("fdatasync .log");
 
         let base = self.seg_written;
         for i in 0..count {
             let (pos, flen) = unpack(buf.entries[i].load(Ordering::Acquire));
             // LSNs are strictly increasing within a buffer, and across buffers within
             // a segment, so each key is unique — `put` overwrites at most on replay.
-            self.index_mem.put(
+            self.cur_mem.put(
                 lsn_to_key(min_lsn + i as u64),
                 encode_offset_len(base + pos as u64, flen),
             );
         }
         self.seg_written = base + padded as u64;
         self.seg_max_lsn = min_lsn + count as u64 - 1;
-        seg.max_live_lsn.store(self.seg_max_lsn, Ordering::Release);
         inner.durable_lsn.store(self.seg_max_lsn, Ordering::Release);
         inner.recycle_buffer(buf);
     }
@@ -403,38 +427,42 @@ impl FlushState {
     /// hold `padded` more bytes. On rollover the prior segment is sealed (MemTable → `.idx`
     /// SST + finalized `.meta`) so the rolled-out segment is self-contained.
     fn ensure_segment(&mut self, inner: &Inner, min_lsn: u64, padded: usize) {
-        let need_new = match &self.cur_seg {
-            None => true,
-            Some(_) => self.seg_written + padded as u64 > inner.config.segment_size as u64,
-        };
+        let need_new = self.seg_written + padded as u64 > inner.config.segment_size as u64;
         if !need_new {
             return;
         }
         self.finalize_segment(inner);
         let seg_id = inner.next_seg_id.fetch_add(1, Ordering::AcqRel);
-        let seg = Segment::create(
+        let (seg, was_created) = Segment::open(
             &inner.dir,
             seg_id,
             inner.config.segment_size,
             inner.config.block_size,
             inner.config.o_direct,
         )
-        .expect("create segment");
+        .expect("open segment");
+        let seg = Arc::new(seg);
+
         // Create-time `.meta`: entry_count == 0 marks the segment active/unsealed —
         // the discriminator recovery uses to rebuild this segment from the `.log` tail.
-        let header = IdxHeader::new(seg_id, min_lsn, 0, 0);
-        seg.write_meta_header_double(&header)
-            .expect("init .meta header");
-        let route = Arc::new(SegmentRoute {
-            seg_id,
-            min_live_lsn: min_lsn,
-            max_live_lsn: AtomicU64::new(min_lsn),
-            segment: Arc::new(seg),
-        });
-        inner.routes.write().unwrap().push(route.clone());
-        self.cur_seg = Some(route);
+        if was_created {
+            let header = IdxHeader::new(seg_id, min_lsn, 0, 0);
+            seg.write_meta_header_double(&header)
+                .expect("init .meta header");
+        }
+
+        let new_mem = Arc::new(MemTable::new());
+
+        // Atomically: move old active → sealed, install new active (single lock).
+        let mut guard = inner.segments.write().unwrap();
+        let old_seg = std::mem::replace(&mut guard.active_seg, Arc::clone(&seg));
+        let _old_mem = std::mem::replace(&mut guard.active_mem, Arc::clone(&new_mem));
+        guard.sealed.push(old_seg);
+        drop(guard);
+
+        self.cur_seg = Some(seg);
+        self.cur_mem = new_mem;
         self.seg_written = 0;
-        self.index_mem = MemTable::new();
         self.seg_min_lsn = min_lsn;
         self.seg_max_lsn = min_lsn;
     }
@@ -445,21 +473,21 @@ impl FlushState {
     /// BEFORE `.meta` records entry_count > 0, so recovery never sees a sealed
     /// header without a readable SST. No-op when no segment is active.
     fn finalize_segment(&mut self, inner: &Inner) {
-        let Some(seg) = self.cur_seg.take() else {
+        let Some(seg) = self.cur_seg.as_ref() else {
             return;
         };
-        let entry_count = self.index_mem.len() as u32;
+        let entry_count = self.cur_mem.len() as u32;
         if entry_count > 0 {
             let block_size = inner.config.block_size;
             let option = SstOption::default().block_size(block_size);
-            let writer = ODirectBlockWriter::create(
-                &idx_path(&inner.dir, seg.seg_id),
+            let writer = SegmentIndexBlockWriter::create(
+                &idx_path(&inner.dir, seg.seg_id()),
                 block_size,
                 inner.config.o_direct,
             )
             .expect("create .idx SST writer");
             let mut builder = SstBuilder::new(ODirectSstWriter::new(writer, &option), option);
-            let mut it = self.index_mem.iter();
+            let mut it = self.cur_mem.iter();
             ForwardIter::seek_to_first(&mut it).expect("index_mem seek_to_first");
             while it.valid() {
                 let k = it.key().unwrap().clone();
@@ -473,11 +501,9 @@ impl FlushState {
             sst_writer.into_inner().sync_all().expect("fdatasync .idx SST");
         }
         let header =
-            IdxHeader::new(seg.seg_id, self.seg_min_lsn, self.seg_max_lsn, entry_count);
-        seg.segment
-            .write_meta_header_double(&header)
+            IdxHeader::new(seg.seg_id(), self.seg_min_lsn, self.seg_max_lsn, entry_count);
+        seg.write_meta_header_double(&header)
             .expect("finalize .meta header");
-        self.index_mem = MemTable::new();
     }
 }
 
