@@ -93,6 +93,16 @@ where
         self.memory_size.load(atomic::Ordering::Relaxed)
     }
 
+    /// Number of entries currently in the table.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether the table holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     /// Return a clone of the internal Arc<SkipMap> for use in read-path iterators.
     pub fn map_arc(&self) -> Arc<SkipMap<K, Entry<V>>> {
         self.map.clone()

@@ -64,8 +64,8 @@ impl BlockReader for WalIndexReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block::FileBlockWriter;
-    use crate::builder::{DefaultSstWriter, SstBuilder, SstOption};
+    use crate::builder::{SstBuilder, SstOption};
+    use crate::wal::{ODirectBlockWriter, ODirectSstWriter};
     use crate::iterators::{
         block_iter::NormalBlockIter,
         data_entry_decode_iter::DataEntryDecodeIter,
@@ -132,10 +132,11 @@ mod tests {
         let path = dir.path().join("seg_0.idx");
         let block_size = 64usize; // small blocks → multi-block SST, multi-level index
 
-        // Build side: buffered FileBlockWriter.
+        // Build side: ODirectSstWriter over ODirectBlockWriter (o_direct=false so
+        // the test runs on tmpfs); the SstWriter pads the footer for O_DIRECT.
         let option = SstOption::default().block_size(block_size);
-        let writer = FileBlockWriter::create(&path, block_size).unwrap();
-        let mut builder = SstBuilder::new(DefaultSstWriter::new(writer, &option), option.clone());
+        let writer = ODirectBlockWriter::create(&path, block_size, false).unwrap();
+        let mut builder = SstBuilder::new(ODirectSstWriter::new(writer, &option), option.clone());
         let n = 40u64;
         for i in 0..n {
             builder

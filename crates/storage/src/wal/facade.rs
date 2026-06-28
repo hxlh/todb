@@ -2,11 +2,11 @@
 //!
 //! Lock-free multi-writer `append` onto an `ArcSwap`-swapped active buffer; a single
 //! flush thread drains full buffers to `.log` (`O_DIRECT` pwrite + pad + `fdatasync`)
-//! and accumulates `.idx` entries via `IdxTail` (block-granularity pwrite). Segment
-//! rollover fires when the active segment can no longer hold the next flushed buffer.
+//! and accumulates LSN→(offset,len) entries in a per-segment `MemTable`. At segment
+//! close the MemTable is sealed to a `.idx` SST and the `.meta` header is finalized.
+//! Segment rollover fires when the active segment can no longer hold the next buffer.
 //! See `docs/architecture/wal-design.md` Write Buffer Architecture + Operation Paths.
 
-use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -18,9 +18,16 @@ use arc_swap::ArcSwap;
 
 use crate::wal::segment::{fdatasync_fd, pwrite_all};
 use crate::wal::{
-    AlignedMem, ENTRIES_PER_BLOCK, HEADER_LEN, IdxEntry, IdxHeader, IdxTail, Lsn, STATE_ACTIVE,
-    STATE_FULL, Segment, WalBuffer, WalConfig, WalError, encode, pack, unpack,
+    HEADER_LEN, IdxHeader, Lsn, ODirectBlockWriter, ODirectSstWriter, STATE_ACTIVE, STATE_FULL,
+    Segment, WalBuffer, WalConfig, WalError, encode, encode_offset_len, idx_path, lsn_to_key, pack,
+    unpack,
 };
+use crate::{
+    builder::{SstBuilder, SstOption},
+    iterators::storage_iter::{ForwardIter, IterRead},
+    memtable::{Entry, MemTable},
+};
+use bytes::Bytes;
 
 const SPIN_THRESHOLD: u32 = 64;
 const SWAP_WAIT_TIMEOUT: Duration = Duration::from_millis(1);
@@ -146,7 +153,7 @@ impl Wal {
 
     /// Block until every lsn claimed so far is durable on disk. Forces the active
     /// buffer through the swap→flush path, then polls `durable_lsn` up to the target.
-    /// Does **not** force-flush `IdxTail` (recovery rebuilds the index tail).
+    /// Does **not** force-seal the index MemTable (recovery rebuilds it from the tail).
     pub fn sync(&self) -> Result<Lsn, WalError> {
         if self.inner.stop_flag.load(Ordering::Acquire) {
             return Err(WalError::Closed);
@@ -301,16 +308,16 @@ impl Drop for Wal {
     }
 }
 
-// ---- flush thread (single writer for `.log` append + `IdxTail` + segment state) ----
+// ---- flush thread (single writer for `.log` append + index MemTable + segment state) ----
 
 struct FlushState {
     cur_seg: Option<Arc<SegmentRoute>>,
     seg_written: u64,
-    idx_tail: IdxTail,
-    idx_blocks: u32,
+    /// Per-active-segment index accumulator: LSN(big-endian) → (offset,len). Sealed
+    /// to a `.idx` SST at segment close. Single-writer (the flush thread owns it).
+    index_mem: MemTable<Bytes, Bytes>,
     seg_min_lsn: u64,
     seg_max_lsn: u64,
-    seg_entry_count: u32,
 }
 
 impl FlushState {
@@ -318,15 +325,14 @@ impl FlushState {
         Self {
             cur_seg: None,
             seg_written: 0,
-            idx_tail: IdxTail::new(),
-            idx_blocks: 0,
+            index_mem: MemTable::new(),
             seg_min_lsn: 0,
             seg_max_lsn: 0,
-            seg_entry_count: 0,
         }
     }
 
-    /// Flush-thread entry: drain `rx` into `.log`/`.idx`, then finalize the last segment.
+    /// Flush-thread entry: drain `rx` into `.log` + the index MemTable, then seal the
+    /// last segment.
     fn run(inner: Arc<Inner>, rx: Receiver<Arc<WalBuffer>>) {
         let mut st = FlushState::new();
         while let Ok(buf) = rx.recv() {
@@ -335,7 +341,7 @@ impl FlushState {
         st.finalize_segment(&inner);
     }
 
-    /// Flush one buffer to `.log` and accumulate its entries into `idx_tail`.
+    /// Flush one buffer to `.log` and accumulate its entries into `index_mem`.
     fn flush_buffer(&mut self, inner: &Inner, buf: &Arc<WalBuffer>) {
         let count = buf.count.load(Ordering::Acquire);
         let min_lsn = buf.min_lsn.load(Ordering::Acquire);
@@ -379,15 +385,12 @@ impl FlushState {
         let base = self.seg_written;
         for i in 0..count {
             let (pos, flen) = unpack(buf.entries[i].load(Ordering::Acquire));
-            let pushed = self.idx_tail.push(IdxEntry {
-                lsn: min_lsn + i as u64,
-                start_offset: base + pos as u64,
-                total_len: flen,
-            });
-            debug_assert!(pushed, "idx_tail push within a block must succeed");
-            if self.idx_tail.len() == ENTRIES_PER_BLOCK {
-                self.write_idx_block(inner, seg.segment.idx_fd());
-            }
+            // LSNs are strictly increasing within a buffer, and across buffers within
+            // a segment, so each key is unique — `put` overwrites at most on replay.
+            self.index_mem.put(
+                lsn_to_key(min_lsn + i as u64),
+                encode_offset_len(base + pos as u64, flen),
+            );
         }
         self.seg_written = base + padded as u64;
         self.seg_max_lsn = min_lsn + count as u64 - 1;
@@ -397,8 +400,8 @@ impl FlushState {
     }
 
     /// Create a new segment if none exists, or roll over when the current segment cannot
-    /// hold `padded` more bytes. On rollover the prior segment's `IdxTail` tail is flushed
-    /// (padded) and its header finalized so the rolled-out segment is self-contained.
+    /// hold `padded` more bytes. On rollover the prior segment is sealed (MemTable → `.idx`
+    /// SST + finalized `.meta`) so the rolled-out segment is self-contained.
     fn ensure_segment(&mut self, inner: &Inner, min_lsn: u64, padded: usize) {
         let need_new = match &self.cur_seg {
             None => true,
@@ -417,9 +420,11 @@ impl FlushState {
             inner.config.o_direct,
         )
         .expect("create segment");
+        // Create-time `.meta`: entry_count == 0 marks the segment active/unsealed —
+        // the discriminator recovery uses to rebuild this segment from the `.log` tail.
         let header = IdxHeader::new(seg_id, min_lsn, 0, 0);
-        seg.write_idx_header_double(&header)
-            .expect("init idx header");
+        seg.write_meta_header_double(&header)
+            .expect("init .meta header");
         let route = Arc::new(SegmentRoute {
             seg_id,
             min_live_lsn: min_lsn,
@@ -429,47 +434,50 @@ impl FlushState {
         inner.routes.write().unwrap().push(route.clone());
         self.cur_seg = Some(route);
         self.seg_written = 0;
-        self.idx_blocks = 0;
-        self.idx_tail = IdxTail::new();
+        self.index_mem = MemTable::new();
         self.seg_min_lsn = min_lsn;
         self.seg_max_lsn = min_lsn;
-        self.seg_entry_count = 0;
     }
 
-    /// Flush any partial `IdxTail` block (padded) and rewrite the header with finalized
-    /// `max_live_lsn` / `entry_count`. No-op when no segment is active.
+    /// Seal the active segment: drain `index_mem` into a `.idx` SST via `O_DIRECT`
+    /// (`ODirectBlockWriter`), `fdatasync` it, then finalize `.meta` with the real
+    /// `max_live_lsn` / `entry_count`. Commit invariant: the `.idx` SST is durable
+    /// BEFORE `.meta` records entry_count > 0, so recovery never sees a sealed
+    /// header without a readable SST. No-op when no segment is active.
     fn finalize_segment(&mut self, inner: &Inner) {
         let Some(seg) = self.cur_seg.take() else {
             return;
         };
-        if !self.idx_tail.is_empty() {
-            self.write_idx_block(inner, seg.segment.idx_fd());
+        let entry_count = self.index_mem.len() as u32;
+        if entry_count > 0 {
+            let block_size = inner.config.block_size;
+            let option = SstOption::default().block_size(block_size);
+            let writer = ODirectBlockWriter::create(
+                &idx_path(&inner.dir, seg.seg_id),
+                block_size,
+                inner.config.o_direct,
+            )
+            .expect("create .idx SST writer");
+            let mut builder = SstBuilder::new(ODirectSstWriter::new(writer, &option), option);
+            let mut it = self.index_mem.iter();
+            ForwardIter::seek_to_first(&mut it).expect("index_mem seek_to_first");
+            while it.valid() {
+                let k = it.key().unwrap().clone();
+                match it.value().unwrap() {
+                    Entry::Put(v) => builder.add(k, v.clone()).expect("sst add"),
+                    Entry::Delete => builder.add_delete(k).expect("sst add_delete"),
+                }
+                ForwardIter::next(&mut it).expect("index_mem next");
+            }
+            let (_footer, sst_writer) = builder.finish().expect("seal .idx SST");
+            sst_writer.into_inner().sync_all().expect("fdatasync .idx SST");
         }
-        let header = IdxHeader::new(
-            seg.seg_id,
-            self.seg_min_lsn,
-            self.seg_max_lsn,
-            self.seg_entry_count,
-        );
+        let header =
+            IdxHeader::new(seg.seg_id, self.seg_min_lsn, self.seg_max_lsn, entry_count);
         seg.segment
-            .write_idx_header_double(&header)
-            .expect("finalize idx header");
-    }
-
-    /// Drain `IdxTail` into one zero-padded 4 KiB block and pwrite it to `.idx` at the
-    /// next entry-block slot (blocks 0–1 are header copies; entries start at block 2).
-    fn write_idx_block(&mut self, inner: &Inner, idx_fd: RawFd) {
-        let n = self.idx_tail.len();
-        let block_bytes = self.idx_tail.drain_into_block();
-        let block_size = inner.config.block_size;
-
-        let mut aligned = AlignedMem::zeroed(block_size, block_size).expect("alloc idx block");
-        aligned.as_bytes_mut()[..block_size].copy_from_slice(&block_bytes);
-        let off = (2 + self.idx_blocks) as i64 * block_size as i64;
-        pwrite_all(idx_fd, aligned.as_bytes(), off).expect("pwrite .idx block");
-        fdatasync_fd(idx_fd).expect("fdatasync .idx block");
-        self.idx_blocks += 1;
-        self.seg_entry_count += n as u32;
+            .write_meta_header_double(&header)
+            .expect("finalize .meta header");
+        self.index_mem = MemTable::new();
     }
 }
 

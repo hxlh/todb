@@ -6,3 +6,4 @@ mod concat_iter_tests;
 mod merge_iter_tests;
 mod two_merge_iter_tests;
 mod reverse_iter_tests;
+mod wal_index_write;

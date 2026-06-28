@@ -2,7 +2,7 @@
 
 **Date**: 2026-06-27
 **Type**: Architecture change (Storage engine internals)
-**Status**: Refreshed post-GAT; revised after audit (B1–B3, M1–M4 addressed); ready for implementation
+**Status**: Refreshed post-GAT; revised after audit (B1–B3, M1–M4 addressed); ready for implementation. **Phase 1.2 + Phase 2 done (2026-06-27/28)** — `WalIndexReader` landed; flush write path retargeted to a per-segment `MemTable` sealed to a `.idx` SST at finalize, header moved to `.meta`, old `IdxTail`/`IdxEntry` format removed. **Phase 2 write side now seals the SST via O_DIRECT, as the design point specifies** (the sub-plan's "buffered `FileBlockWriter`" detour was reversed 2026-06-28 per request). It is a two-type pair in `wal/odirect_writer.rs`: `ODirectBlockWriter` (a dumb `BlockWriter` — asserts `block_size`, aligned `pwrite`) + `ODirectSstWriter` (`SstWriter` — `write_footer` pads the variable footer to one block as `[body][padding][trailer]`); this keeps the raw writer encoding-free per the `BlockWriter`/`SstWriter` seam. Phase 3's footer decode must match the padded layout. Next: Phase 3 (`SegmentIndex` get/scan) — must assign each segment's index a unique `file_id` (or per-segment index `DiskManager`) to avoid the cache-key collision surfaced by the Phase 2 multi-segment test, and decode the `.idx` footer in the padded layout.
 **Autonomy**: plan-first (protected area: WAL internals)
 **Reviewer**: subagent
 

@@ -13,6 +13,7 @@ pub mod frame;
 pub mod index;
 pub mod index_reader;
 pub mod lsn;
+pub mod odirect_writer;
 pub mod record;
 pub mod segment;
 mod error;
@@ -25,9 +26,11 @@ pub use error::WalError;
 pub use facade::Wal;
 pub use frame::{DecodedFrame, HEADER_LEN, encode};
 pub use index::{
-    ENTRIES_PER_BLOCK, IDX_HEADER_LEN, IdxEntry, IdxHeader, IdxTail, select_valid_header,
+    IDX_HEADER_LEN, IdxHeader, decode_offset_len, encode_offset_len, idx_path, key_to_lsn,
+    log_path, lsn_to_key, meta_path, select_valid_header,
 };
 pub use index_reader::WalIndexReader;
 pub use lsn::{Lsn, LsnRange};
+pub use odirect_writer::{ODirectBlockWriter, ODirectSstWriter};
 pub use record::{Record, RecordRef};
 pub use segment::Segment;

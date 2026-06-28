@@ -1,57 +1,72 @@
-//! `.idx` on-disk structures: entry, header (double-write), and the in-memory
-//! `IdxTail` accumulator flushed at 204-entry block granularity.
+//! Segment index on-disk structures and helpers.
 //!
-//! # On-disk layout (fixed little-endian — independent of host CPU byte order)
+//! # Layout (per segment)
 //!
-//! LE is chosen to match mainstream storage formats (SQLite / PostgreSQL / InnoDB)
-//! and to be native on the target LE CPUs (x86-64 / AArch64) — zero `bswap` on the
-//! hot path. The format is fixed and must not depend on the host byte order.
+//! - `seg_{seg_id:05}.meta` — mutable [`IdxHeader`] (36 B), double-written to two
+//!   `block_size` copies for crash consistency. Carries `min/max_live_lsn` +
+//!   `entry_count`. Rewrite-only on truncate; `entry_count == 0` marks the segment
+//!   active/unsealed (the discriminator recovery will use).
+//! - `seg_{seg_id:05}.idx` — immutable SST mapping LSN→(offset,len), sealed once
+//!   at segment close via `SstBuilder`. Read back zero-copy through `WalIndexReader`.
+//! - `seg_{seg_id:05}.log` — frames (unchanged).
 //!
-//! - `IdxEntry` (20 B): `lsn: u64 | start_offset: u64 | total_len: u32`.
-//!   `total_len == 0` is the padding sentinel (recovery stops there).
-//! - `IdxHeader` (36 B): `magic[4] | version: u32 | seg_id: u32 | min_live_lsn: u64
-//!   | max_live_lsn: u64 | entry_count: u32 | header_crc: u32` (crc32 over [0,32)).
-//!   Stored in two identical copies (block 0 = A, block 1 = B); entries begin at block 2.
+//! # Encoding
+//!
+//! The header is fixed little-endian (matches SQLite/PostgreSQL/InnoDB, native on
+//! the target LE CPUs). The SST key/value encoding is:
+//! - Key: LSN as 8-byte **big-endian** (lexicographic byte order == numeric order).
+//! - Value: `(offset: u64, len: u32)` little-endian, 12 B.
+
+use std::path::{Path, PathBuf};
+
+use bytes::{Bytes, BytesMut};
 
 use crate::wal::WalError;
 
-/// One index entry: `(lsn, start_offset, total_len)` — 20 B, little-endian.
-/// `total_len == 0` is the padding sentinel (recovery stops there).
-pub struct IdxEntry {
-    pub lsn: u64,
-    pub start_offset: u64,
-    pub total_len: u32,
+// ---- encoding helpers ----
+
+/// Encode an LSN as an 8-byte big-endian key (lexicographic == numeric order).
+pub fn lsn_to_key(lsn: u64) -> Bytes {
+    Bytes::copy_from_slice(&lsn.to_be_bytes())
 }
 
-impl IdxEntry {
-    pub const SERIALIZED_LEN: usize = 20;
+/// Decode an 8-byte big-endian key back to an LSN.
+pub fn key_to_lsn(key: &[u8]) -> u64 {
+    u64::from_be_bytes(key[..8].try_into().expect("lsn key is 8 bytes"))
+}
 
-    pub fn serialize(&self) -> [u8; Self::SERIALIZED_LEN] {
-        let mut buf = [0u8; Self::SERIALIZED_LEN];
-        buf[0..8].copy_from_slice(&self.lsn.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.start_offset.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.total_len.to_le_bytes());
-        buf
-    }
+/// Encode `(offset, len)` as a 12-byte little-endian value: `offset:u64 ++ len:u32`.
+pub fn encode_offset_len(offset: u64, len: u32) -> Bytes {
+    let mut b=BytesMut::with_capacity(12);
+    b.extend_from_slice(&offset.to_le_bytes());
+    b.extend_from_slice(&len.to_le_bytes());
+    b.freeze()
+}
 
-    /// Deserialize from a 20 B slice. Returns `None` if `buf` is too short.
-    pub fn deserialize(buf: &[u8]) -> Option<Self> {
-        if buf.len() < Self::SERIALIZED_LEN {
-            return None;
-        }
-        Some(Self {
-            lsn: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
-            start_offset: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-            total_len: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
-        })
-    }
+/// Decode a 12-byte little-endian value into `(offset, len)`.
+pub fn decode_offset_len(b: &[u8]) -> (u64, u32) {
+    (
+        u64::from_le_bytes(b[0..8].try_into().expect("offset is 8 bytes")),
+        u32::from_le_bytes(b[8..12].try_into().expect("len is 4 bytes")),
+    )
+}
+
+// ---- path helpers ----
+
+/// Segment file paths: `seg_{seg_id:05}.{log,meta,idx}`. Zero-padded so a
+/// directory listing is already in seg_id order (recovery scans + sorts the dir).
+pub fn log_path(dir: &Path, seg_id: u32) -> PathBuf {
+    dir.join(format!("seg_{seg_id:05}.log"))
+}
+pub fn meta_path(dir: &Path, seg_id: u32) -> PathBuf {
+    dir.join(format!("seg_{seg_id:05}.meta"))
+}
+pub fn idx_path(dir: &Path, seg_id: u32) -> PathBuf {
+    dir.join(format!("seg_{seg_id:05}.idx"))
 }
 
 pub const MAGIC: [u8; 4] = *b"WIDX";
 pub const IDX_HEADER_LEN: usize = 36;
-/// Entries per 4 KiB block: `floor(4096 / 20) = 204`.
-pub const ENTRIES_PER_BLOCK: usize = 204;
-pub const BLOCK_SIZE: usize = 4096;
 
 /// `.idx` header (36 B). Stored in two identical copies (block 0 = A, block 1 = B);
 /// `header_crc` covers bytes [0,32).
@@ -150,86 +165,36 @@ pub fn select_valid_header(copy_a: &[u8], copy_b: &[u8]) -> Result<IdxHeader, Wa
     }
 }
 
-/// In-memory accumulator for `.idx` entries, flushed at `ENTRIES_PER_BLOCK` granularity.
-/// Single-writer (the flush thread owns it).
-pub struct IdxTail {
-    entries: Vec<IdxEntry>,
-}
-
-impl IdxTail {
-    pub fn new() -> Self {
-        Self {
-            entries: Vec::with_capacity(ENTRIES_PER_BLOCK),
-        }
-    }
-
-    pub fn push(&mut self, entry: IdxEntry) -> bool {
-        if self.entries.len() >= ENTRIES_PER_BLOCK {
-            return false;
-        }
-        self.entries.push(entry);
-        true
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.entries.len() >= ENTRIES_PER_BLOCK
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Serialize the accumulated entries into one 4 KiB block (entries + zero padding),
-    /// clearing the accumulator. Padding slots read back as `total_len == 0` (sentinel).
-    pub fn drain_into_block(&mut self) -> Vec<u8> {
-        let mut block = vec![0u8; BLOCK_SIZE];
-        for (i, e) in self.entries.drain(..).enumerate() {
-            let off = i * IdxEntry::SERIALIZED_LEN;
-            block[off..off + IdxEntry::SERIALIZED_LEN].copy_from_slice(&e.serialize());
-        }
-        block
-    }
-}
-
-impl Default for IdxTail {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn entry_serialize_roundtrip() {
-        let e = IdxEntry {
-            lsn: 42,
-            start_offset: 0x1234,
-            total_len: 88,
-        };
-        let bytes = e.serialize();
-        assert_eq!(bytes.len(), 20);
-        let d = IdxEntry::deserialize(&bytes).unwrap();
-        assert_eq!(d.lsn, 42);
-        assert_eq!(d.start_offset, 0x1234);
-        assert_eq!(d.total_len, 88);
+    fn lsn_key_ordering_preserved() {
+        // big-endian ⇒ lexicographic byte order == numeric order
+        assert!(lsn_to_key(1) < lsn_to_key(2));
+        assert!(lsn_to_key(255) < lsn_to_key(256));
+        assert!(lsn_to_key(u64::MAX - 1) < lsn_to_key(u64::MAX));
+        assert_eq!(key_to_lsn(&lsn_to_key(0x0f0e_0d0c_0b0a_0908)), 0x0f0e_0d0c_0b0a_0908);
     }
 
     #[test]
-    fn padding_sentinel_is_zero_total_len() {
-        let zero = IdxEntry {
-            lsn: 0,
-            start_offset: 0,
-            total_len: 0,
-        };
-        let bytes = zero.serialize();
-        // 全零 → recovery 视为 padding
-        assert!(bytes.iter().all(|&b| b == 0));
+    fn offset_len_roundtrip() {
+        for (off, len) in [(0u64, 0u32), (0x1234, 88), (u64::MAX, u32::MAX), (1 << 40, 4096)] {
+            let v = encode_offset_len(off, len);
+            assert_eq!(v.len(), 12);
+            assert_eq!(decode_offset_len(&v), (off, len));
+        }
+    }
+
+    #[test]
+    fn paths_are_zero_padded_and_ordered() {
+        let dir = Path::new("/tmp");
+        assert_eq!(log_path(dir, 7), Path::new("/tmp/seg_00007.log"));
+        assert_eq!(meta_path(dir, 42), Path::new("/tmp/seg_00042.meta"));
+        assert_eq!(idx_path(dir, 42), Path::new("/tmp/seg_00042.idx"));
+        // listing order == numeric seg_id order (no lexicographic surprise)
+        assert!(log_path(dir, 9).to_str().unwrap() < log_path(dir, 10).to_str().unwrap());
     }
 
     #[test]
@@ -271,47 +236,5 @@ mod tests {
         a[12] ^= 0xff;
         b[12] ^= 0xff;
         assert!(select_valid_header(&a, &b).is_err());
-    }
-
-    #[test]
-    fn idx_tail_fills_to_204_then_rejects() {
-        let mut tail = IdxTail::new();
-        for i in 0..ENTRIES_PER_BLOCK {
-            assert!(tail.push(IdxEntry {
-                lsn: i as u64,
-                start_offset: 0,
-                total_len: 16
-            }));
-        }
-        assert!(tail.is_full());
-        assert!(!tail.push(IdxEntry {
-            lsn: 999,
-            start_offset: 0,
-            total_len: 16
-        }));
-    }
-
-    #[test]
-    fn idx_tail_drain_into_block_pads_to_4k() {
-        let mut tail = IdxTail::new();
-        for i in 0..10 {
-            tail.push(IdxEntry {
-                lsn: i,
-                start_offset: i * 16,
-                total_len: 16,
-            });
-        }
-        let block = tail.drain_into_block();
-        assert_eq!(block.len(), BLOCK_SIZE);
-        // 前 10 个 entries 正确
-        for i in 0..10u64 {
-            let off = (i as usize) * 20;
-            let e = IdxEntry::deserialize(&block[off..off + 20]).unwrap();
-            assert_eq!(e.lsn, i);
-        }
-        // 第 11 槽（offset 200）是 padding（全零）
-        let pad = &block[200..220];
-        assert!(pad.iter().all(|&b| b == 0));
-        assert!(tail.is_empty());
     }
 }
