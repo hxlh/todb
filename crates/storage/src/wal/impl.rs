@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 
-use crate::iterators::ScanIter;
 use crate::wal::segment::{fdatasync_fd, pwrite_all};
+use crate::wal::{DiskManager, WalIter};
 use crate::wal::{
     HEADER_LEN, IdxHeader, Lsn, SegmentIndexBlockWriter, ODirectSstWriter, STATE_ACTIVE, STATE_FULL,
     Segment, WalBuffer, WalConfig, WalError, encode, encode_offset_len, idx_path, lsn_to_key, pack,
@@ -172,9 +172,20 @@ impl Wal {
     }
 
 
-    pub fn scan(&self, _range: (Bound<Lsn>, Bound<Lsn>)) -> Result<(), WalError> {
-        // TODO: Phase 4b scan implementation
-        unimplemented!("scan not yet implemented")
+    pub fn scan(&self, range: (Bound<Lsn>, Bound<Lsn>)) -> Result<WalIter, WalError> {
+        let guard = self.inner.segments.read().unwrap();
+        let sealed = guard.sealed.clone();
+        let active_seg = Arc::clone(&guard.active_seg);
+        let active_mem = Arc::clone(&guard.active_mem);
+        drop(guard);
+
+        // Create DiskManager for block cache
+        let dm = Arc::new(DiskManager::new(
+            self.inner.config.block_size,
+            self.inner.config.read_cache_blocks,
+        )?);
+
+        WalIter::new(sealed, active_seg, active_mem, dm, range)
     }
 
     /// Block until every lsn claimed so far is durable on disk. Forces the active

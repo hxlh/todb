@@ -251,6 +251,30 @@ impl DiskManager {
     pub fn block_size(&self) -> usize {
         self.inner.block_size
     }
+
+    /// Read arbitrary bytes from an fd at an offset, bypassing the block cache.
+    /// Allocates aligned memory for O_DIRECT compatibility. Used for reading
+    /// SST footers and other metadata.
+    pub fn raw_read(&self, fd: RawFd, offset: u64, len: usize) -> Result<Vec<u8>, WalError> {
+        let block_size = self.inner.block_size;
+
+        // Align offset down to block boundary
+        let aligned_offset = (offset / block_size as u64) * block_size as u64;
+        let offset_in_block = (offset - aligned_offset) as usize;
+
+        // Align length up to block boundary
+        let total_len = offset_in_block + len;
+        let aligned_len = ((total_len + block_size - 1) / block_size) * block_size;
+
+        // Allocate aligned buffer
+        let mut aligned_buf = AlignedMem::zeroed(aligned_len, block_size)?;
+
+        // Read into aligned buffer
+        pread_all(fd, aligned_buf.as_bytes_mut(), aligned_offset as i64)?;
+
+        // Extract the requested slice
+        Ok(aligned_buf.as_bytes()[offset_in_block..offset_in_block + len].to_vec())
+    }
 }
 
 /// Owned (`'static`), pinned handle to a cached block's bytes. `Drop` unpins the

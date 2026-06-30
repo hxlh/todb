@@ -12,6 +12,7 @@ pub mod r#impl;
 pub mod frame;
 pub mod index;
 pub mod index_reader;
+pub mod iter;
 pub mod lsn;
 pub mod odirect_writer;
 pub mod record;
@@ -30,6 +31,7 @@ pub use index::{
     log_path, lsn_to_key, meta_path, select_valid_header,
 };
 pub use index_reader::WalIndexReader;
+pub use iter::WalIter;
 pub use lsn::{Lsn, LsnRange};
 pub use odirect_writer::{SegmentIndexBlockWriter, ODirectSstWriter};
 pub use record::{Record, RecordRef};
